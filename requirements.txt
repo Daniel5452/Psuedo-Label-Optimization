@@ -1,0 +1,28 @@
+# --- Core ---
+onedl
+opencv-python
+scikit-image
+tqdm
+numpy
+pillow
+requests
+
+# --- Interactive Menus ---
+inquirer
+ipywidgets
+
+# --- Experiment Tracking / DB ---
+#sqlite3  # (Optional, usually built-in with Python >= 3.7)
+
+# --- Config Parsing ---
+pyyaml
+
+# --- Jupyter Environment ---
+#jupyter
+ipykernel
+
+# --- Optional for File Paths / Types ---
+#python-dotenv  # if you ever want to load secrets or paths from a `.env`
+
+# --- Segment Anything (optional, only if you're using SAM) ---
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git

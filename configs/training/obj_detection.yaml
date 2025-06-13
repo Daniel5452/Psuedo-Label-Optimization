@@ -1,0 +1,6 @@
+# Object Detection. Can be changed by user
+
+model_class: "FasterRCNNConfig"   # matches the exact class name
+backbone: "REGNET_GF3_2"
+epochs: 50
+batch_size: 6
