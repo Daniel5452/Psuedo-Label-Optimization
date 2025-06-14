@@ -25,7 +25,7 @@ except ImportError:
 
 
 class DatabaseManager:
-    """Handles all database operations and metadata logging."""
+    """Handles all database operations and metadata logging with continuous updates."""
 
     def __init__(self, db_path):
         self.db_path = db_path
@@ -39,11 +39,12 @@ class DatabaseManager:
         return conn, cursor
 
     def _initialize_metadata_db(self):
-        """Initialize the metadata database table."""
+        """Initialize the metadata database table with status tracking."""
         self.cursor.execute('''
         CREATE TABLE IF NOT EXISTS iteration_metadata (
             flow_id TEXT,
             iteration INTEGER,
+            status TEXT DEFAULT 'INITIALIZED',
             num_gt_images INTEGER,
             num_gt_images_added INTEGER,
             num_pseudo_images INTEGER,
@@ -62,40 +63,91 @@ class DatabaseManager:
             cvat_project_id INTEGER,
             train_cfg TEXT,
             timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+            completed_timestamp TEXT,
             PRIMARY KEY (flow_id, iteration)
         )
         ''')
         self.conn.commit()
 
-    def log_iteration(self, **kwargs):
-        """Log iteration metadata to database."""
+    def initialize_iteration(self, **kwargs):
+        """Initialize a new iteration with basic metadata."""
         train_cfg_str = str(kwargs.get('train_cfg')) if kwargs.get('train_cfg') is not None else None
 
         self.cursor.execute('''
-            INSERT INTO iteration_metadata (
-                flow_id, iteration,
+            INSERT OR REPLACE INTO iteration_metadata (
+                flow_id, iteration, status,
                 num_gt_images, num_gt_images_added,
                 num_pseudo_images, num_pseudo_images_added,
                 total_train_size,
                 main_dataset, validation_set, train_dataset,
-                pseudo_input_dataset_name, pseudo_output_dataset_name,
-                inference_model_uid, model_uid, evaluation_uid, evaluation_info,
-                manual_correction, cvat_project_id, train_cfg
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                inference_model_uid, manual_correction, cvat_project_id, train_cfg
+            ) VALUES (?, ?, 'INITIALIZED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             kwargs['flow_id'], kwargs['iteration'],
             kwargs['num_gt_images'], kwargs['num_gt_images_added'],
             kwargs['num_pseudo_images'], kwargs['num_pseudo_images_added'],
             kwargs['total_train_size'],
             kwargs['main_dataset'], kwargs['validation_dataset'], kwargs['train_dataset'],
-            kwargs['pseudo_input_dataset_name'], kwargs['pseudo_output_dataset_name'],
-            kwargs['inference_model_uid'], kwargs['model_uid'], kwargs['evaluation_uid'], kwargs['evaluation_info'],
-            kwargs['manual_correction'], kwargs['cvat_project_id'], train_cfg_str
+            kwargs['inference_model_uid'], kwargs['manual_correction'],
+            kwargs['cvat_project_id'], train_cfg_str
         ))
         self.conn.commit()
 
+    def update_iteration_field(self, flow_id, iteration, **updates):
+        """Update specific fields for an iteration."""
+        if not updates:
+            return
+
+        set_clauses = []
+        values = []
+
+        for field, value in updates.items():
+            set_clauses.append(f"{field} = ?")
+            values.append(value)
+
+        values.extend([flow_id, iteration])
+
+        query = f"""
+            UPDATE iteration_metadata 
+            SET {', '.join(set_clauses)}
+            WHERE flow_id = ? AND iteration = ?
+        """
+
+        self.cursor.execute(query, values)
+        self.conn.commit()
+
+    def update_status(self, flow_id, iteration, status):
+        """Update the status of an iteration."""
+        self.update_iteration_field(flow_id, iteration, status=status)
+
+    def complete_iteration(self, flow_id, iteration):
+        """Mark an iteration as completed with timestamp."""
+        self.update_iteration_field(
+            flow_id, iteration,
+            status='COMPLETED',
+            completed_timestamp=time.strftime('%Y-%m-%d %H:%M:%S')
+        )
+
+    def get_iteration_status(self, flow_id, iteration):
+        """Get the current status of an iteration."""
+        self.cursor.execute(
+            'SELECT status FROM iteration_metadata WHERE flow_id = ? AND iteration = ?',
+            (flow_id, iteration)
+        )
+        result = self.cursor.fetchone()
+        return result[0] if result else None
+
+    def get_last_completed_iteration(self, flow_id):
+        """Get the last completed iteration number for a flow."""
+        self.cursor.execute(
+            'SELECT MAX(iteration) FROM iteration_metadata WHERE flow_id = ? AND status = "COMPLETED"',
+            (flow_id,)
+        )
+        result = self.cursor.fetchone()
+        return result[0] if result and result[0] is not None else None
+
     def get_last_iteration(self, flow_id):
-        """Get the last iteration number for a flow."""
+        """Get the last iteration number for a flow (completed or not)."""
         self.cursor.execute('SELECT MAX(iteration) FROM iteration_metadata WHERE flow_id = ?', (flow_id,))
         result = self.cursor.fetchone()
         return result[0] if result and result[0] is not None else None
@@ -114,6 +166,35 @@ class DatabaseManager:
         self.cursor.execute('SELECT COUNT(*) FROM iteration_metadata WHERE flow_id = ?', (flow_id,))
         result = self.cursor.fetchone()
         return result[0] > 0
+
+    def log_iteration_0(self, **kwargs):
+        """Log iteration 0 to the database (legacy method for compatibility)."""
+        train_cfg_str = str(kwargs.get('train_cfg')) if kwargs.get('train_cfg') is not None else None
+
+        self.cursor.execute('''
+            INSERT OR REPLACE INTO iteration_metadata (
+                flow_id, iteration, status,
+                num_gt_images, num_gt_images_added,
+                num_pseudo_images, num_pseudo_images_added,
+                total_train_size,
+                main_dataset, validation_set, train_dataset,
+                pseudo_input_dataset_name, pseudo_output_dataset_name,
+                inference_model_uid, model_uid, evaluation_uid, evaluation_info,
+                manual_correction, cvat_project_id, train_cfg,
+                completed_timestamp
+            ) VALUES (?, ?, 'COMPLETED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            kwargs['flow_id'], kwargs['iteration'],
+            kwargs['num_gt_images'], kwargs['num_gt_images_added'],
+            kwargs['num_pseudo_images'], kwargs['num_pseudo_images_added'],
+            kwargs['total_train_size'],
+            kwargs['main_dataset'], kwargs['validation_dataset'], kwargs['train_dataset'],
+            kwargs['pseudo_input_dataset_name'], kwargs['pseudo_output_dataset_name'],
+            kwargs['inference_model_uid'], kwargs['model_uid'], kwargs['evaluation_uid'], kwargs['evaluation_info'],
+            kwargs['manual_correction'], kwargs['cvat_project_id'], train_cfg_str,
+            time.strftime('%Y-%m-%d %H:%M:%S')
+        ))
+        self.conn.commit()
 
 
 class CVATManager:
@@ -414,7 +495,7 @@ class CVATManager:
 class PseudoLabelingPipeline:
     """
     Main pseudo-labeling pipeline for object detection and instance segmentation.
-    Handles complete workflow from data preparation to model training and evaluation.
+    Handles complete workflow from data preparation to model training and evaluation with continuous logging.
     """
 
     def __init__(self, project_name, main_dataset_name, initial_annotated_dataset_name,
@@ -457,17 +538,24 @@ class PseudoLabelingPipeline:
         self.current_flow = current_flow
         self.flow_id = f'f{current_flow}'
         self.train_dataset_name = f"train-{self.flow_id}"
-        # NOTE: Removed self.initial_annotations_name - we'll use initial_annotated_dataset_name directly
         self.pseudo_input_dataset_name = None
         self.predicted_dataset_name = None
         self.n_initial_samples = None
 
         # Determine current iteration based on database state
-        last_iteration = self.db.get_last_iteration(self.flow_id)
-        if last_iteration is None:
+        last_completed = self.db.get_last_completed_iteration(self.flow_id)
+        if last_completed is None:
             self.current_iteration = 0  # New flow, start at 0
         else:
-            self.current_iteration = last_iteration + 1  # Resume from next iteration
+            # Check if there's an incomplete iteration
+            last_any = self.db.get_last_iteration(self.flow_id)
+            current_status = self.db.get_iteration_status(self.flow_id, last_any) if last_any is not None else None
+
+            if current_status == 'COMPLETED':
+                self.current_iteration = last_any + 1  # Start next iteration
+            else:
+                self.current_iteration = last_any  # Resume incomplete iteration
+                print(f"⚠️  Resuming incomplete iteration {self.current_iteration} (status: {current_status})")
 
         # models and eval
         self.train_cfg = None
@@ -502,7 +590,7 @@ class PseudoLabelingPipeline:
         # Check if this flow already exists and set up accordingly
         if self.db.flow_exists(self.flow_id):
             print(f"Flow {self.flow_id} already exists in database - ready to resume")
-            print(f"Last completed iteration: {last_iteration}")
+            print(f"Last completed iteration: {last_completed}")
 
             # Check if training dataset exists
             try:
@@ -683,8 +771,7 @@ class PseudoLabelingPipeline:
     # ========== FLOW SETUP METHODS ==========
 
     def setup_next_iteration(self, manual_corrections, current_flow=None):
-        """Set up the next iteration for the current flow."""
-        self.manual_corrections_global = manual_corrections
+        """Set up the next iteration for the current flow with status validation."""
 
         # If current_flow is provided, set up flow variables (for kernel restart scenarios)
         if current_flow is not None:
@@ -692,24 +779,48 @@ class PseudoLabelingPipeline:
             self.flow_id = f'f{current_flow}'
             self.train_dataset_name = f"train-{self.flow_id}"
 
-        # Ensure flow_id is set (either from current session or parameter)
+        # Ensure flow_id is set
         if self.flow_id is None:
             raise RuntimeError(
                 "Flow ID not set. Please provide current_flow parameter or run setup_initial_flow first.")
 
-        # Get the last iteration for the specified flow
-        last_iteration = self.db.get_last_iteration(self.flow_id)
-        if last_iteration is None:
-            raise RuntimeError(f"No iteration history found for flow: {self.flow_id}")
+        # Check if current iteration is complete before proceeding
+        if self.current_iteration > 0:
+            current_status = self.db.get_iteration_status(self.flow_id, self.current_iteration)
+            if current_status == 'COMPLETED':
+                # Move to next iteration
+                self.current_iteration += 1
+                print(f"Previous iteration completed. Moving to iteration {self.current_iteration}")
+            elif current_status is None:
+                # This shouldn't happen, but handle gracefully
+                print(f"No status found for iteration {self.current_iteration}. Proceeding...")
+            else:
+                print(f"Current iteration {self.current_iteration} status: {current_status}")
+                user_input = input("Do you want to restart this iteration? (y/n): ").lower().strip()
+                if user_input == 'y':
+                    print(f"Restarting iteration {self.current_iteration}")
+                else:
+                    print("Continuing with current iteration...")
 
-        self.current_iteration = last_iteration + 1
+        self.manual_corrections_global = manual_corrections
 
-        # Get previous model UID and image counts
-        result = self.db.get_previous_model_data(self.flow_id, self.current_iteration - 1)
-        if result is None:
-            raise RuntimeError(f"No model metadata found for {self.flow_id} @ iteration {self.current_iteration - 1}")
+        # Get the last completed iteration for the specified flow
+        last_completed = self.db.get_last_completed_iteration(self.flow_id)
+        if last_completed is None and self.current_iteration > 0:
+            raise RuntimeError(f"No completed iteration history found for flow: {self.flow_id}")
 
-        self.inference_model_uid, previous_gt_total, previous_pseudo_total = result
+        # For iteration 0, use initial dataset; for others, get previous model data
+        if self.current_iteration == 0:
+            previous_gt_total = 0
+            previous_pseudo_total = 0
+            self.inference_model_uid = ""
+        else:
+            # Get previous model UID and image counts
+            result = self.db.get_previous_model_data(self.flow_id, self.current_iteration - 1)
+            if result is None:
+                raise RuntimeError(
+                    f"No model metadata found for {self.flow_id} @ iteration {self.current_iteration - 1}")
+            self.inference_model_uid, previous_gt_total, previous_pseudo_total = result
 
         # Define image additions based on correction mode
         if manual_corrections:
@@ -726,11 +837,29 @@ class PseudoLabelingPipeline:
         # Define dataset names
         self.pseudo_input_dataset_name = f"pseudo-iter{self.current_iteration}-{self.flow_id}"
 
+        # Initialize the iteration in the database
+        self.db.initialize_iteration(
+            flow_id=self.flow_id,
+            iteration=self.current_iteration,
+            num_gt_images=self.num_gt_images_after_iter,
+            num_gt_images_added=self.num_gt_images_added,
+            num_pseudo_images=self.num_pseudo_images_after_iter,
+            num_pseudo_images_added=self.num_pseudo_images_added,
+            total_train_size=total_train_size,
+            main_dataset=self.main_dataset_name,
+            validation_dataset=self.validation_dataset,
+            train_dataset=self.train_dataset_name,
+            inference_model_uid=self.inference_model_uid,
+            manual_correction=manual_corrections,
+            cvat_project_id=self.cvat_project_id,
+            train_cfg=self.train_cfg
+        )
+
         # Enhanced output formatting
         print("-" * 40)
-        print("FLOW INITIALIZATION COMPLETE")
+        print("ITERATION INITIALIZED")
         print("=" * 40)
-        print(f"Resuming flow_id: {self.flow_id}")
+        print(f"Flow ID: {self.flow_id}")
         print(f"Current iteration: {self.current_iteration}")
         print(f"Manual corrections: {manual_corrections}")
         print(f"Sample size this iteration: {self.sample_size_per_iter}")
@@ -750,23 +879,29 @@ class PseudoLabelingPipeline:
         self.inference_model_uid = model_uid
         print(f"Inference model UID set to: {self.inference_model_uid}")
 
-    # ========== PIPELINE METHODS ==========
+        # Update database
+        self.db.update_iteration_field(
+            self.flow_id, self.current_iteration,
+            inference_model_uid=self.inference_model_uid
+        )
+
+    # ========== PIPELINE METHODS WITH CONTINUOUS LOGGING ==========
+
     def sample_unseen_inputs(self):
         """
-        Enhanced sampling function that:
-        1. Samples new unseen inputs for the current iteration
-        2. Finds ALL past pseudo-labeled datasets from this flow where manual_correction = False
-        3. Merges them for re-inference with the current (better) model
-        4. Returns the combined dataset ready for inference
+        Enhanced sampling function with continuous logging.
         """
         print(f"\n=== ENHANCED SAMPLING FOR ITERATION {self.current_iteration} ===")
+
+        # Update status
+        self.db.update_status(self.flow_id, self.current_iteration, 'SAMPLING')
 
         # Step 1: Load initial annotations (shared across all flows)
         try:
             initial_dataset = self.client.datasets.load(self.initial_annotated_dataset_name, pull_policy="missing")
-            print(f"✓ Loaded initial annotations: {len(initial_dataset)} images")
+            print(f"Loaded initial annotations: {len(initial_dataset)} images")
         except Exception as e:
-            print(f"✗ Could not load initial annotations {self.initial_annotated_dataset_name}: {e}")
+            print(f"Could not load initial annotations {self.initial_annotated_dataset_name}: {e}")
             raise
 
         # Step 2: Sample new unseen inputs for current iteration
@@ -786,7 +921,7 @@ class PseudoLabelingPipeline:
 
         # Create input-only dataset for new samples
         new_input_dataset = Dataset(inputs=new_sampled_data.inputs)
-        print(f"✓ Sampled {self.sample_size_per_iter} new images for iteration {self.current_iteration}")
+        print(f"Sampled {self.sample_size_per_iter} new images for iteration {self.current_iteration}")
 
         # Step 3: Find ALL past pseudo-labeled datasets from this flow
         past_pseudo_datasets = []
@@ -794,7 +929,7 @@ class PseudoLabelingPipeline:
         self.db.cursor.execute('''
             SELECT iteration, pseudo_input_dataset_name, manual_correction
             FROM iteration_metadata
-            WHERE flow_id = ? AND iteration < ? AND manual_correction = 0
+            WHERE flow_id = ? AND iteration < ? AND manual_correction = 0 AND status = 'COMPLETED'
             ORDER BY iteration
         ''', (self.flow_id, self.current_iteration))
 
@@ -807,7 +942,7 @@ class PseudoLabelingPipeline:
                     past_dataset = self.client.datasets.load(past_dataset_name, pull_policy="missing")
                     past_input_dataset = Dataset(inputs=past_dataset.inputs)
                     past_pseudo_datasets.append(past_input_dataset)
-                    print(f"  ✓ Loaded {len(past_input_dataset)} images from iteration {past_iter}")
+                    print(f"Loaded {len(past_input_dataset)} images from iteration {past_iter}")
                 except Exception as e:
                     print(f"  ✗ Warning: Could not load {past_dataset_name}: {e}")
 
@@ -833,12 +968,22 @@ class PseudoLabelingPipeline:
         self.client.datasets.push(self.pseudo_input_dataset_name, push_policy="version")
 
         print(
-            f"✓ Saved combined dataset '{self.pseudo_input_dataset_name}' with {len(combined_dataset)} images for inference")
+            f"Saved combined dataset '{self.pseudo_input_dataset_name}' with {len(combined_dataset)} images for inference")
+
+        # Update database with sampling completion
+        self.db.update_iteration_field(
+            self.flow_id, self.current_iteration,
+            pseudo_input_dataset_name=self.pseudo_input_dataset_name,
+            status='SAMPLING_COMPLETE'
+        )
 
     def run_inference(self):
-        """Run inference on pseudo input dataset to generate predictions."""
+        """Run inference on pseudo input dataset to generate predictions with logging."""
         if self.inference_model_uid is None:
             raise ValueError("Inference model UID not set. Use set_inference_model_uid() first.")
+
+        print(f"Running inference with model: {self.inference_model_uid}")
+        self.db.update_status(self.flow_id, self.current_iteration, 'INFERENCE')
 
         config = EvaluationConfig(
             model_name=self.inference_model_uid,
@@ -849,20 +994,38 @@ class PseudoLabelingPipeline:
 
         job = self.client.jobs.submit(config)
         self.predicted_dataset_name = self.client.jobs.get_dataset(job)
+
         print(f"Inference complete")
         print(f"Predictions saved as: {self.predicted_dataset_name}")
 
+        # Update database
+        self.db.update_iteration_field(
+            self.flow_id, self.current_iteration,
+            pseudo_output_dataset_name=self.predicted_dataset_name,
+            status='INFERENCE_COMPLETE'
+        )
+
     def set_predicted_dataset(self, dataset_name):
-        """Manually set the predicted dataset name (for testing or when skipping inference)."""
+        """Manually set the predicted dataset name with logging."""
         self.predicted_dataset_name = dataset_name
         print(f"Predicted dataset set to: {self.predicted_dataset_name}")
         print("Ready to proceed to manual corrections or merge.")
 
+        # Update database
+        self.db.update_iteration_field(
+            self.flow_id, self.current_iteration,
+            pseudo_output_dataset_name=self.predicted_dataset_name,
+            status='INFERENCE_COMPLETE'
+        )
+
     def manually_correct_cvat(self):
-        """Export predictions to CVAT for manual correction."""
+        """Export predictions to CVAT for manual correction with logging."""
         if not self.manual_corrections_global:
             print("Manual corrections not enabled for this iteration.")
             return
+
+        print("Starting CVAT export process...")
+        self.db.update_status(self.flow_id, self.current_iteration, 'CVAT_EXPORT')
 
         # Get user input
         username = input("CVAT Username: ")
@@ -875,9 +1038,13 @@ class PseudoLabelingPipeline:
             print("\nCVAT export completed successfully!")
             print("Please complete your annotations in CVAT.")
             print("The next cell will handle importing the corrected annotations and merging.")
+
+            # Update status to indicate CVAT work is needed
+            self.db.update_status(self.flow_id, self.current_iteration, 'CVAT_PENDING')
+
         except Exception as e:
             print(f"CVAT export failed: {e}")
-
+            self.db.update_status(self.flow_id, self.current_iteration, 'CVAT_FAILED')
 
     def _export_to_cvat(self, username, password, project_name):
         """Internal method to handle CVAT export with full JSON preprocessing."""
@@ -915,7 +1082,8 @@ class PseudoLabelingPipeline:
         with open(json_path, "r") as f:
             coco_data = json.load(f)
 
-        print(f"Before fixes - Categories: {len(coco_data.get('categories', []))}, Images: {len(coco_data.get('images', []))}, Annotations: {len(coco_data.get('annotations', []))}")
+        print(
+            f"Before fixes - Categories: {len(coco_data.get('categories', []))}, Images: {len(coco_data.get('images', []))}, Annotations: {len(coco_data.get('annotations', []))}")
 
         # Fix 1: Clean image file names
         for image_entry in coco_data.get("images", []):
@@ -995,7 +1163,8 @@ class PseudoLabelingPipeline:
         if "licenses" not in coco_data:
             coco_data["licenses"] = []
 
-        print(f"After fixes - Categories: {len(categories)}, Images: {len(coco_data.get('images', []))}, Annotations: {len(coco_data.get('annotations', []))}")
+        print(
+            f"After fixes - Categories: {len(categories)}, Images: {len(coco_data.get('images', []))}, Annotations: {len(coco_data.get('annotations', []))}")
 
         # Save the corrected COCO file
         with open(json_path, "w") as f:
@@ -1027,7 +1196,22 @@ class PseudoLabelingPipeline:
         except Exception as e:
             print(f"Error during CVAT upload: {e}")
 
-    # Replace the existing import_cvat_corrections_and_merge method in PseudoLabelingPipeline class with these methods:
+    def merge_pseudo_labels(self):
+        """
+        Merge pseudo-labeled predictions into the training dataset with logging.
+        """
+        print("Starting merge process...")
+        self.db.update_status(self.flow_id, self.current_iteration, 'MERGING')
+
+        if self.manual_corrections_global:
+            print("Manual corrections mode - importing from CVAT and merging...")
+            self.import_cvat_corrections_and_merge()
+        else:
+            print("Automated mode - merging pseudo-labels directly...")
+            self._merge_automated_pseudo_labels()
+
+        # Update status after successful merge
+        self.db.update_status(self.flow_id, self.current_iteration, 'MERGE_COMPLETE')
 
     def import_cvat_corrections_and_merge(self):
         """Import corrected annotations from CVAT and merge with training dataset."""
@@ -1169,6 +1353,12 @@ class PseudoLabelingPipeline:
             self.predicted_dataset_name = corrected_dataset_name
             print(f"Updated predicted dataset with CVAT corrections: {corrected_dataset_name}")
 
+            # Update database with corrected dataset name
+            self.db.update_iteration_field(
+                self.flow_id, self.current_iteration,
+                pseudo_output_dataset_name=self.predicted_dataset_name
+            )
+
             # Now merge with training dataset
             self._merge_corrected_labels()
 
@@ -1243,22 +1433,13 @@ class PseudoLabelingPipeline:
         print(
             f"Merged datasets into '{self.train_dataset_name}': {len(initial_dataset)} initial + {len(pseudo_dataset)} pseudo = {len(merged)} total")
 
-    def merge_pseudo_labels(self):
-        """
-        Merge pseudo-labeled predictions into the training dataset.
-        Handles both manual corrections (from CVAT) and automated pseudo-labels.
-        """
-        if self.manual_corrections_global:
-            print("Manual corrections mode - importing from CVAT and merging...")
-            self.import_cvat_corrections_and_merge()
-        else:
-            print("Automated mode - merging pseudo-labels directly...")
-            self._merge_automated_pseudo_labels()
-
     def train_model(self):
-        """Train model on current dataset."""
+        """Train model on current dataset with logging."""
         if self.train_cfg is None:
             raise ValueError("Training configuration not set. Run setup_training_config() first.")
+
+        print("Starting model training...")
+        self.db.update_status(self.flow_id, self.current_iteration, 'TRAINING')
 
         model_type = self.train_cfg['model_type']
 
@@ -1323,9 +1504,18 @@ class PseudoLabelingPipeline:
         print(f"Training job submitted")
         print(f"Model UID: {self.model_uid}")
 
+        # Update database with model UID
+        self.db.update_iteration_field(
+            self.flow_id, self.current_iteration,
+            model_uid=self.model_uid,
+            status='TRAINING_COMPLETE'
+        )
+
     def evaluate_model(self):
-        """Evaluate the current model on validation dataset."""
+        """Evaluate the current model on validation dataset with logging."""
         print(f'Evaluating {self.model_uid} on {self.validation_dataset}')
+        self.db.update_status(self.flow_id, self.current_iteration, 'EVALUATING')
+
         config = EvaluationConfig(
             model_name=self.model_uid,
             dataset_name=self.validation_dataset,
@@ -1344,15 +1534,65 @@ class PseudoLabelingPipeline:
             print("Evaluation complete")
             print(f"Report URL: {report_url}")
             print(f"Metrics: {self.evaluation_info_str}")
+
+            # Update database with evaluation results
+            self.db.update_iteration_field(
+                self.flow_id, self.current_iteration,
+                evaluation_uid=self.evaluation_uid,
+                evaluation_info=self.evaluation_info_str,
+                status='EVALUATION_COMPLETE'
+            )
         else:
             self.evaluation_info_str = ""
             print("Evaluation incomplete or failed")
+            self.db.update_status(self.flow_id, self.current_iteration, 'EVALUATION_FAILED')
+
+    def complete_iteration(self):
+        """
+        Complete the current iteration and prepare for the next one.
+        This should be called after all steps are finished.
+        """
+        # Verify that all required fields are filled
+        required_fields = ['model_uid', 'evaluation_uid']
+
+        # Check current iteration data
+        self.db.cursor.execute(
+            'SELECT model_uid, evaluation_uid FROM iteration_metadata WHERE flow_id = ? AND iteration = ?',
+            (self.flow_id, self.current_iteration)
+        )
+        result = self.db.cursor.fetchone()
+
+        if not result:
+            raise RuntimeError(f"No data found for iteration {self.current_iteration}")
+
+        model_uid, eval_uid = result
+
+        # Check if essential fields are filled
+        if not model_uid:
+            raise RuntimeError("Cannot complete iteration: model_uid is missing. Please run train_model() first.")
+        if not eval_uid:
+            raise RuntimeError(
+                "Cannot complete iteration: evaluation_uid is missing. Please run evaluate_model() first.")
+
+        # Mark iteration as completed
+        self.db.complete_iteration(self.flow_id, self.current_iteration)
+
+        print("=" * 50)
+        print("ITERATION COMPLETED SUCCESSFULLY")
+        print("=" * 50)
+        print(f"Flow: {self.flow_id}")
+        print(f"Iteration: {self.current_iteration}")
+        print(f"Model UID: {model_uid}")
+        print(f"Evaluation UID: {eval_uid}")
+        print("=" * 50)
+        print("Ready to start next iteration with setup_next_iteration()")
+        print("=" * 50)
 
     # ========== LOGGING METHODS ==========
 
     def log_iteration_0(self):
-        """Log iteration 0 to the database."""
-        self.db.log_iteration(
+        """Log iteration 0 to the database (legacy method for compatibility)."""
+        self.db.log_iteration_0(
             flow_id=self.flow_id,
             iteration=0,
             num_gt_images=self.n_initial_samples,
@@ -1376,40 +1616,18 @@ class PseudoLabelingPipeline:
 
         print(f"Iteration 0 logged for {self.flow_id}")
 
-    def log_iteration(self):
-        """Log regular iterations to the database."""
-        dataset_init = self.client.datasets.load(self.train_dataset_name)
-
-        self.db.log_iteration(
-            flow_id=self.flow_id,
-            iteration=self.current_iteration,
-            num_gt_images=self.num_gt_images_after_iter,
-            num_gt_images_added=self.num_gt_images_added,
-            num_pseudo_images=self.num_pseudo_images_after_iter,
-            num_pseudo_images_added=self.num_pseudo_images_added,
-            total_train_size=len(dataset_init),
-            train_dataset=self.train_dataset_name,
-            pseudo_input_dataset_name=self.pseudo_input_dataset_name,
-            pseudo_output_dataset_name=self.predicted_dataset_name,
-            inference_model_uid=self.inference_model_uid,
-            model_uid=self.model_uid,
-            evaluation_uid=self.evaluation_uid,
-            evaluation_info=self.evaluation_info_str,
-            manual_correction=self.manual_corrections_global,
-            cvat_project_id=self.cvat_project_id,
-            main_dataset=self.main_dataset_name,
-            validation_dataset=self.validation_dataset,
-            train_cfg=self.train_cfg
-        )
-
-        print("Iteration metadata logged")
-
     def get_pipeline_status(self):
         """Display current pipeline status and state information."""
         print(f"\nPIPELINE STATUS REPORT")
         print(f"=" * 50)
         print(f"Flow ID: {self.flow_id}")
         print(f"Current Iteration: {self.current_iteration}")
+
+        # Get current iteration status from database
+        current_status = self.db.get_iteration_status(self.flow_id, self.current_iteration)
+        if current_status:
+            print(f"Current Status: {current_status}")
+
         print(f"Training Dataset: {self.train_dataset_name}")
         print(f"Current Model UID: {self.model_uid}")
         print(f"Training Configuration: {self.train_cfg}")
@@ -1423,4 +1641,19 @@ class PseudoLabelingPipeline:
 
         print(f"Sample Size Per Iteration: {self.sample_size_per_iter}")
         print(f"Minimum Confidence Threshold: {self.min_confidence}")
+
+        # Show recent iterations status
+        print(f"\nRECENT ITERATIONS:")
+        self.db.cursor.execute('''
+            SELECT iteration, status, completed_timestamp 
+            FROM iteration_metadata 
+            WHERE flow_id = ? 
+            ORDER BY iteration DESC 
+            LIMIT 5
+        ''', (self.flow_id,))
+
+        for iteration, status, completed_time in self.db.cursor.fetchall():
+            completion_info = f" (completed: {completed_time})" if completed_time else ""
+            print(f"  Iteration {iteration}: {status}{completion_info}")
+
         print(f"=" * 50)
