@@ -1,6 +1,6 @@
 # Pseudo-Labeling Pipeline for Object Detection & Instance Segmentation
 
-![Pseudo-Labeling Workflow](./images/workflow.gif)
+![Pseudo-Labeling Workflow](/uploads/27032eedef10aae81e822e0d9e35c123/workflow.gif)
 
 An automated pseudo-labeling pipeline designed to streamline the annotation process for computer vision tasks. This tool iteratively improves model performance by using an initial model trained on a small set of manually annotated data to generate labels on new images, which can then be refined and used to retrain progressively better models.
 
