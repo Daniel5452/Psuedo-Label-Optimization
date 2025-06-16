@@ -889,12 +889,20 @@ class PseudoLabelingPipeline:
 
     def sample_unseen_inputs(self):
         """
-        Enhanced sampling function with continuous logging.
+        Enhanced sampling function with continuous logging and validation.
         """
         print(f"\n=== ENHANCED SAMPLING FOR ITERATION {self.current_iteration} ===")
 
         # Update status
         self.db.update_status(self.flow_id, self.current_iteration, 'SAMPLING')
+
+        # VALIDATION: Check if inference_model_uid is set for iterations > 0
+        if self.current_iteration > 0 and (self.inference_model_uid is None or self.inference_model_uid == ""):
+            raise ValueError(
+                f"Inference model UID not set for iteration {self.current_iteration}. "
+                f"Please call set_inference_model_uid() with the model from iteration {self.current_iteration - 1}, "
+                f"or ensure setup_next_iteration() was called properly."
+            )
 
         # Step 1: Load initial annotations (shared across all flows)
         try:
@@ -976,6 +984,7 @@ class PseudoLabelingPipeline:
             pseudo_input_dataset_name=self.pseudo_input_dataset_name,
             status='SAMPLING_COMPLETE'
         )
+
 
     def run_inference(self):
         """Run inference on pseudo input dataset to generate predictions with logging."""
@@ -1657,3 +1666,118 @@ class PseudoLabelingPipeline:
             print(f"  Iteration {iteration}: {status}{completion_info}")
 
         print(f"=" * 50)
+
+    def clear_database(self, confirm_phrase="DELETE ALL DATA"):
+        """
+        DANGER: Completely clears the entire database.
+
+        This function deletes ALL data from the metadata database, including all flows,
+        iterations, and tracking information. This is intended for testing purposes only.
+
+        Args:
+            confirm_phrase (str): Must type "DELETE ALL DATA" exactly to confirm deletion
+
+        Raises:
+            ValueError: If confirmation phrase doesn't match exactly
+        """
+        print("=" * 50)
+        print("DANGER: DATABASE DELETION REQUESTED")
+        print("=" * 50)
+        print("This will permanently delete ALL pipeline metadata including:")
+        print("- All flow data")
+        print("- All iteration records")
+        print("- All model and evaluation tracking")
+        print("- All CVAT project associations")
+        print("\nThis action CANNOT be undone!")
+        print("=" * 50)
+
+        # Get user confirmation
+        user_input = input(f'Type "{confirm_phrase}" exactly to confirm deletion: ')
+
+        if user_input != confirm_phrase:
+            print("CANCELLED: Confirmation phrase incorrect. Database deletion cancelled.")
+            print("Database remains intact.")
+            return False
+
+        try:
+            # Drop the entire table
+            self.db.cursor.execute('DROP TABLE IF EXISTS iteration_metadata')
+            self.db.conn.commit()
+
+            # Recreate the empty table structure
+            self.db._initialize_metadata_db()
+
+            print("SUCCESS: Database successfully cleared!")
+            print("SUCCESS: Empty database structure recreated.")
+            print("Pipeline is now reset and ready for fresh use.")
+
+            # Reset pipeline state
+            self.current_iteration = 0
+            self.model_uid = None
+            self.evaluation_uid = None
+            self.evaluation_info_str = None
+            self.inference_model_uid = None
+
+            print("SUCCESS: Pipeline state reset to initial values.")
+            return True
+
+        except Exception as e:
+            print(f"ERROR: Error clearing database: {e}")
+            print("Database may be in an inconsistent state. Check manually.")
+            return False
+
+    def get_all_flows_summary(self):
+        """
+        Display a summary of all flows and their status in the database.
+        Useful before clearing database to see what will be lost.
+        """
+        print("=" * 60)
+        print("DATABASE CONTENTS SUMMARY")
+        print("=" * 60)
+
+        # Get all flows
+        self.db.cursor.execute('''
+            SELECT DISTINCT flow_id 
+            FROM iteration_metadata 
+            ORDER BY flow_id
+        ''')
+        flows = [row[0] for row in self.db.cursor.fetchall()]
+
+        if not flows:
+            print("Database is empty - no flows found.")
+            return
+
+        total_iterations = 0
+        total_completed = 0
+
+        for flow_id in flows:
+            print(f"\nFlow: {flow_id}")
+            print("-" * 30)
+
+            # Get iterations for this flow
+            self.db.cursor.execute('''
+                SELECT iteration, status, num_gt_images, num_pseudo_images, 
+                       model_uid, completed_timestamp
+                FROM iteration_metadata 
+                WHERE flow_id = ? 
+                ORDER BY iteration
+            ''', (flow_id,))
+
+            iterations = self.db.cursor.fetchall()
+            flow_iterations = len(iterations)
+            flow_completed = len([i for i in iterations if i[1] == 'COMPLETED'])
+
+            total_iterations += flow_iterations
+            total_completed += flow_completed
+
+            print(f"Iterations: {flow_iterations} total, {flow_completed} completed")
+
+            for iteration, status, gt_imgs, pseudo_imgs, model_uid, completed in iterations:
+                status_icon = "DONE" if status == "COMPLETED" else "PENDING"
+                total_imgs = (gt_imgs or 0) + (pseudo_imgs or 0)
+                model_short = model_uid[:8] + "..." if model_uid else "None"
+                print(f"  {status_icon} Iter {iteration}: {status} | {total_imgs} images | Model: {model_short}")
+
+        print("=" * 60)
+        print(f"TOTAL: {len(flows)} flows, {total_iterations} iterations, {total_completed} completed")
+        print("=" * 60)

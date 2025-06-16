@@ -1,6 +1,6 @@
 # Pseudo-Labeling Pipeline for Object Detection & Instance Segmentation
 
-![Pseudo-Labeling Workflow](./images/pseudo_labeling_workflow.gif)
+[//]: # (![Pseudo-Labeling Workflow]&#40;./images/workflow.gif&#41;)
 
 An automated pseudo-labeling pipeline designed to streamline the annotation process for computer vision tasks. This tool iteratively improves model performance by using an initial model trained on a small set of manually annotated data to generate labels on new images, which can then be refined and used to retrain progressively better models.
 
@@ -45,7 +45,6 @@ Pseudo-labeling is a semi-supervised learning technique where:
 - **Unlabeled Dataset**: Large collection of images to progressively label
 - **Validation Dataset**: Separate dataset for model evaluation
 - **CVAT Account** (Optional): For manual correction workflow
-- **Computational Resources**: For model training (GPU recommended)
 
 ## Installation
 
@@ -53,7 +52,7 @@ Pseudo-labeling is a semi-supervised learning technique where:
 
 ```bash
 # Install required Python packages
-pip install onedl requests sqlite3 ipywidgets jupyter
+pip install -r requirements.txt
 ```
 
 ### 2. Download Pipeline Files
@@ -93,7 +92,7 @@ pipeline = PseudoLabelingPipeline(
     min_confidence=0.5,                                        # Confidence threshold
     local_path='/path/to/your/local/storage',                  # Local storage path
     cvat_project_id=88,                                        # CVAT project ID (optional)
-    db_path="pseudo_labeling_metadata.db"                      # Database file path
+    db_path="pseudo_labeling_metadata.db"                      # Database file path (No need to change)
 )
 ```
 
@@ -110,9 +109,14 @@ This opens an interactive widget where you can select:
 - **Backbone**: Neural network architecture
 - **Training Parameters**: Epochs, batch size, etc.
 
-### Step 3: Choose Correction Strategy
+### Step 3: Follow Notebook Steps to Train Initial Model (Section 1)
+- **This includes steps**
+  - 1.1 Training and Evaluation
+  - 1.2 Logging for Initial Metadata
 
-For each iteration, decide your correction strategy:
+### Step 4: Choose Correction Strategy (Section 2)
+
+After training initial model, for each iteration, decide your correction strategy:
 
 ```python
 # For manual corrections via CVAT
@@ -133,8 +137,8 @@ Follow the notebook cells to execute each step of the pipeline automatically.
 ### Flows vs Iterations
 
 - **Flow**: A complete pseudo-labeling experiment with specific configuration
-  - Example: Flow 0 might use FasterRCNN with manual corrections
-  - Example: Flow 1 might use MaskRCNN with automated labeling
+  - Example: Flow 0 might use FasterRCNN with manual corrections and 50 initial annotated images.
+  - Example: Flow 1 might use MaskRCNN with automated labeling and 150 initial annotated images.
   
 - **Iteration**: Individual training cycles within a flow
   - Iteration 0: Train on initial annotated data only
@@ -144,7 +148,7 @@ Follow the notebook cells to execute each step of the pipeline automatically.
 
 The pipeline implements intelligent data accumulation:
 - **New Samples**: Each iteration samples fresh unlabeled images
-- **Past Pseudo-Labels**: All previously used pseudo-labeled images are re-processed
+- **Past Pseudo-Labels**: All previously used pseudo-labeled images are re-processed after each iteration.
 - **Updated Predictions**: Newer, better models generate improved labels on old data
 - **Progressive Growth**: Training set expands while improving label quality
 
@@ -153,8 +157,10 @@ The pipeline implements intelligent data accumulation:
 The SQLite database tracks comprehensive metadata:
 - Flow and iteration information
 - Dataset names and sizes
+- Number of ground truths and pseudo labeled images
 - Model and evaluation UIDs
 - Training configurations
+- Evaluation metrics
 - Status tracking
 - Timestamps and completion records
 
@@ -227,11 +233,11 @@ Predictions → Confidence Filtering → Direct Merge
 
 ### Advanced Parameters
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `local_path` | Local storage directory | Required |
-| `cvat_project_id` | CVAT project ID | `None` |
-| `db_path` | Database file path | `"pseudo_labeling_metadata.db"` |
+| Parameter | Description | Default                              |
+|-----------|-------------|--------------------------------------|
+| `local_path` | Local storage directory | Required if `manual_correction = True` |
+| `cvat_project_id` | CVAT project ID | `None`                               |
+| `db_path` | Database file path | `"pseudo_labeling_metadata.db"`      |
 
 ### Training Configuration Options
 
@@ -256,8 +262,7 @@ Predictions → Confidence Filtering → Direct Merge
 ### Prerequisites
 
 1. **CVAT Instance**: Access to a CVAT server
-   - Public instances: `https://app.cvat.ai`
-   - Self-hosted: Your organization's CVAT server
+   - VBTI Server URL: `https:cvat2.vbti.nl`
 
 2. **Account Credentials**: Username and password for CVAT
 
@@ -291,12 +296,6 @@ pipeline.manually_correct_cvat()
 pipeline.merge_pseudo_labels()
 ```
 
-### CVAT Best Practices
-
-- **Review Strategy**: Focus on correcting obvious errors first
-- **Consistency**: Maintain consistent annotation standards
-- **Quality Control**: Review a subset of corrections for quality
-- **Time Management**: Set reasonable time limits per image
 
 ## Database Management
 
@@ -414,25 +413,19 @@ Error: Training job failed
 
 ### Performance Optimization
 
-#### 1. Batch Size Tuning
-- Start with smaller batch sizes (4-8)
-- Increase gradually based on GPU memory
-- Monitor training speed vs. memory usage
-
-#### 2. Confidence Threshold
-- Higher thresholds (0.7-0.9): Fewer but higher quality pseudo-labels
+#### 1. Confidence Threshold
+- Higher thresholds (0.7-0.9): Fewer but higher quality pseudo-labels (Recommended)
 - Lower thresholds (0.3-0.5): More pseudo-labels but potentially noisier
 
-#### 3. Sample Size Strategy
-- Smaller iterations (50-100): More control, slower progress
+#### 2. Sample Size Strategy
+- Smaller iterations (50-100): More control, slower progress (Recommended)
 - Larger iterations (200-500): Faster progress, less control
 
-#### 4. Storage Management
-- Regular cleanup of temporary exports
-- Monitor local storage usage
-- Archive completed iterations
+#### 3. Database 
+- It is highly recommended to review the SQLite database to ensure all processes are functioning correctly and no issues have occurred.
 
-## Advanced Usage
+
+## Advanced Usage and Notes
 
 ### Multiple Flow Management
 
@@ -463,13 +456,14 @@ train_cfg = {
     'backbone': MaskRCNNBackbone.REGNETX_4GF,
     'epochs': 75,
     'batch_size': 8
+    ('More advanced configs will be added soon...')
 }
 pipeline.train_cfg = train_cfg
 ```
 
-### Batch Processing
+### Batch Processing (Automatic Iterations)
 
-Process multiple iterations programmatically:
+Process multiple iterations at once:
 
 ```python
 for iteration in range(1, 6):  # Run 5 iterations
@@ -482,23 +476,8 @@ for iteration in range(1, 6):  # Run 5 iterations
     pipeline.complete_iteration()
     print(f"Iteration {iteration} completed")
 ```
+Please note that to run this loop, `manual_corrections` must be `False`
 
-### Integration with External Tools
-
-#### Custom Evaluation Metrics
-```python
-# Add custom evaluation after standard evaluation
-pipeline.evaluate_model()
-# ... run custom metrics
-# ... log additional results
-```
-
-#### Data Quality Assessment
-```python
-# Analyze prediction confidence distributions
-predicted_dataset = pipeline.client.datasets.load(pipeline.predicted_dataset_name)
-# ... analyze confidence scores
-# ... identify low-confidence regions
 ```
 
 ### Performance Monitoring
@@ -534,13 +513,11 @@ results = pipeline.db.cursor.fetchall()
 
 ### 3. Resource Management
 - **Storage Planning**: Monitor disk usage for exports and datasets
-- **Compute Optimization**: Balance training time with resource costs
-- **Backup Strategy**: Regular database and model backups
+- **Database Review**: Regularly review the database
 - **Documentation**: Track configuration decisions and results
 
 ### 4. Experimental Design
 - **Control Groups**: Compare different flows/strategies
-- **Ablation Studies**: Test individual components
 - **Baseline Comparison**: Compare against traditional annotation
 - **Statistical Significance**: Ensure meaningful improvement
 
@@ -556,33 +533,15 @@ results = pipeline.db.cursor.fetchall()
 - Data accumulation across iterations
 
 ### Planned Enhancements
-- Active learning strategies
-- Multi-model ensemble predictions
-- Automated quality assessment
-- Integration with more annotation tools
-- Performance analytics dashboard
+- Automatic CVAT Export
+- Specifying CVAT organization project and folder
+- Performance Analysis by implementing automatic visualizations using backend database 
 
 ---
-
-## Contributing
-
-Contributions are welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Add comprehensive tests
-4. Update documentation
-5. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Acknowledgments
 
-- OneDL platform for dataset management and model training
-- CVAT project for annotation capabilities
-- Open source computer vision community
+- OneDL access required for dataset management and model training
+- CVAT access required for annotation capabilities
 
 ---
-
-**Ready to accelerate your annotation workflow? Start with the Quick Start guide above!**
