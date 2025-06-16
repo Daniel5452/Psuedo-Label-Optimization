@@ -1,6 +1,6 @@
 # Pseudo-Labeling Pipeline for Object Detection & Instance Segmentation
 
-[//]: # (![Pseudo-Labeling Workflow]&#40;./images/workflow.gif&#41;)
+![Pseudo-Labeling Workflow](./images/workflow.gif)
 
 An automated pseudo-labeling pipeline designed to streamline the annotation process for computer vision tasks. This tool iteratively improves model performance by using an initial model trained on a small set of manually annotated data to generate labels on new images, which can then be refined and used to retrain progressively better models.
 
@@ -478,24 +478,6 @@ for iteration in range(1, 6):  # Run 5 iterations
 ```
 Please note that to run this loop, `manual_corrections` must be `False`
 
-```
-
-### Performance Monitoring
-
-Track metrics across iterations:
-
-```python
-# Extract metrics from database
-pipeline.db.cursor.execute('''
-    SELECT iteration, evaluation_info 
-    FROM iteration_metadata 
-    WHERE flow_id = ? AND status = 'COMPLETED'
-    ORDER BY iteration
-''', (pipeline.flow_id,))
-
-results = pipeline.db.cursor.fetchall()
-# ... plot performance trends
-```
 
 ## Best Practices
 
