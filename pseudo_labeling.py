@@ -890,6 +890,7 @@ class PseudoLabelingPipeline:
     def sample_unseen_inputs(self):
         """
         Enhanced sampling function with continuous logging and validation.
+        Now includes deduplication to avoid counting the same images multiple times.
         """
         print(f"\n=== ENHANCED SAMPLING FOR ITERATION {self.current_iteration} ===")
 
@@ -907,9 +908,9 @@ class PseudoLabelingPipeline:
         # Step 1: Load initial annotations (shared across all flows)
         try:
             initial_dataset = self.client.datasets.load(self.initial_annotated_dataset_name, pull_policy="missing")
-            print(f"Loaded initial annotations: {len(initial_dataset)} images")
+            print(f"✓ Loaded initial annotations: {len(initial_dataset)} images")
         except Exception as e:
-            print(f"Could not load initial annotations {self.initial_annotated_dataset_name}: {e}")
+            print(f"✗ Could not load initial annotations {self.initial_annotated_dataset_name}: {e}")
             raise
 
         # Step 2: Sample new unseen inputs for current iteration
@@ -929,11 +930,9 @@ class PseudoLabelingPipeline:
 
         # Create input-only dataset for new samples
         new_input_dataset = Dataset(inputs=new_sampled_data.inputs)
-        print(f"Sampled {self.sample_size_per_iter} new images for iteration {self.current_iteration}")
+        print(f"✓ Sampled {self.sample_size_per_iter} new images for iteration {self.current_iteration}")
 
         # Step 3: Find ALL past pseudo-labeled datasets from this flow
-        past_pseudo_datasets = []
-
         self.db.cursor.execute('''
             SELECT iteration, pseudo_input_dataset_name, manual_correction
             FROM iteration_metadata
@@ -943,40 +942,60 @@ class PseudoLabelingPipeline:
 
         past_pseudo_results = self.db.cursor.fetchall()
 
+        # Step 4: Load and deduplicate past pseudo datasets
+        all_past_hashes = set()
+        deduplicated_past_datasets = []
+
         for past_iter, past_dataset_name, was_manual in past_pseudo_results:
             if past_dataset_name and past_dataset_name.strip():
                 try:
-                    print(f"  Found past pseudo dataset: {past_dataset_name} (iteration {past_iter})")
+                    print(f"  Loading past pseudo dataset: {past_dataset_name} (iteration {past_iter})")
                     past_dataset = self.client.datasets.load(past_dataset_name, pull_policy="missing")
-                    past_input_dataset = Dataset(inputs=past_dataset.inputs)
-                    past_pseudo_datasets.append(past_input_dataset)
-                    print(f"Loaded {len(past_input_dataset)} images from iteration {past_iter}")
-                except Exception as e:
-                    print(f"  ✗ Warning: Could not load {past_dataset_name}: {e}")
 
-        # Step 4: Merge new samples with ALL past pseudo datasets
+                    # Get hashes for this dataset
+                    dataset_hashes = set(past_dataset.inputs.hash_iterator())
+                    unique_hashes = dataset_hashes - all_past_hashes
+
+                    if unique_hashes:
+                        # Keep only unique images from this dataset
+                        hash_to_index = {h: i for i, h in enumerate(past_dataset.inputs.hash_iterator())}
+                        unique_indices = [hash_to_index[h] for h in unique_hashes]
+                        unique_dataset = Dataset(inputs=past_dataset.inputs[unique_indices])
+                        deduplicated_past_datasets.append(unique_dataset)
+                        all_past_hashes.update(unique_hashes)
+
+                        print(f"Added {len(unique_dataset)} unique images from iteration {past_iter} "
+                              f"(skipped {len(dataset_hashes) - len(unique_hashes)} duplicates)")
+                    else:
+                        print(
+                            f"All {len(dataset_hashes)} images from iteration {past_iter} were duplicates - skipped")
+
+                except Exception as e:
+                    print(f"Warning: Could not load {past_dataset_name}: {e}")
+
+        # Step 5: Merge new samples with deduplicated past datasets
         combined_dataset = new_input_dataset
 
-        if past_pseudo_datasets:
-            print(f"Merging new samples with {len(past_pseudo_datasets)} past pseudo datasets")
+        if deduplicated_past_datasets:
+            print(f"\nMerging new samples with {len(deduplicated_past_datasets)} deduplicated past datasets:")
 
-            for i, past_dataset in enumerate(past_pseudo_datasets):
+            for i, past_dataset in enumerate(deduplicated_past_datasets):
                 combined_dataset = combined_dataset + past_dataset
-                print(f"  Merged past dataset {i + 1}: total size now {len(combined_dataset)}")
+                print(f"  Merged dataset {i + 1}: total size now {len(combined_dataset)}")
 
             total_images = len(combined_dataset)
             past_images = total_images - self.sample_size_per_iter
             print(
-                f"Final combined dataset: {self.sample_size_per_iter} new + {past_images} past = {total_images} total images")
+                f"\n✓ Final combined dataset: {self.sample_size_per_iter} new + {past_images} unique past = {total_images} total images")
         else:
             print(f"No past pseudo datasets found. Using only {len(combined_dataset)} new samples.")
 
-        # Step 5: Save the combined dataset for inference
+        # Step 6: Save the combined dataset for inference
         self.client.datasets.save(self.pseudo_input_dataset_name, dataset=combined_dataset, exist="overwrite")
         self.client.datasets.push(self.pseudo_input_dataset_name, push_policy="version")
 
         print(
-            f"Saved combined dataset '{self.pseudo_input_dataset_name}' with {len(combined_dataset)} images for inference")
+            f"✓ Saved combined dataset '{self.pseudo_input_dataset_name}' with {len(combined_dataset)} images for inference")
 
         # Update database with sampling completion
         self.db.update_iteration_field(
@@ -984,7 +1003,6 @@ class PseudoLabelingPipeline:
             pseudo_input_dataset_name=self.pseudo_input_dataset_name,
             status='SAMPLING_COMPLETE'
         )
-
 
     def run_inference(self):
         """Run inference on pseudo input dataset to generate predictions with logging."""
@@ -1408,39 +1426,89 @@ class PseudoLabelingPipeline:
     def _ensure_label_consistency_and_merge(self, training_dataset, pseudo_dataset):
         """
         Enhanced merging that combines:
-        1. Initial annotations (shared global dataset)
-        2. New pseudo-labeled dataset (with updated predictions from ALL past pseudo data)
+        1. Initial annotations (original GT dataset - kept clean)
+        2. ALL manually corrected data from previous iterations in this flow
+        3. New pseudo-labeled dataset (current iteration)
 
-        This ensures we always start from clean initial annotations plus current pseudo-labels.
+        This creates the combined dataset in memory without modifying the original initial dataset.
         """
         print(f"\n=== ENHANCED MERGING FOR ITERATION {self.current_iteration} ===")
 
-        # Load initial annotations (shared across all flows)
+        # Step 1: Load initial annotations (shared across all flows - kept clean)
         initial_dataset = self.client.datasets.load(self.initial_annotated_dataset_name, pull_policy="missing")
-        print(f"✓ Loaded initial annotations: {len(initial_dataset)} images")
-        print(f"✓ Loaded new pseudo-labeled dataset: {len(pseudo_dataset)} images")
+        print(f"✓ Loaded clean initial annotations: {len(initial_dataset)} images")
 
-        # Ensure label map consistency
-        if initial_dataset.targets.has_frozen_label_map():
-            label_map = initial_dataset.targets.get_frozen_label_map()
-        elif initial_dataset.targets.has_frozen_labels():
-            label_map = LabelMap.from_labels(initial_dataset.targets.get_frozen_labels())
+        # Step 2: Find and load ALL manually corrected datasets from this flow
+        self.db.cursor.execute('''
+            SELECT iteration, pseudo_output_dataset_name, manual_correction
+            FROM iteration_metadata
+            WHERE flow_id = ? AND iteration < ? AND manual_correction = 1 AND status = 'COMPLETED'
+            ORDER BY iteration
+        ''', (self.flow_id, self.current_iteration))
+
+        manual_correction_results = self.db.cursor.fetchall()
+
+        manually_corrected_datasets = []
+        total_manual_images = 0
+
+        for past_iter, corrected_dataset_name, was_manual in manual_correction_results:
+            if corrected_dataset_name and corrected_dataset_name.strip():
+                try:
+                    print(f"  Loading manually corrected dataset: {corrected_dataset_name} (iteration {past_iter})")
+                    corrected_dataset = self.client.datasets.load(corrected_dataset_name, pull_policy="missing")
+                    manually_corrected_datasets.append(corrected_dataset)
+                    total_manual_images += len(corrected_dataset)
+                    print(f"  ✓ Added {len(corrected_dataset)} manually corrected images from iteration {past_iter}")
+                except Exception as e:
+                    print(f"  ✗ Warning: Could not load manually corrected dataset {corrected_dataset_name}: {e}")
+
+        # Step 3: Combine initial annotations with all manual corrections (IN MEMORY ONLY)
+        # This creates a new dataset object without modifying the original initial_dataset
+        combined_gt_dataset = Dataset(inputs=initial_dataset.inputs, targets=initial_dataset.targets)
+
+        if manually_corrected_datasets:
+            print(
+                f"\nCombining initial GT with {len(manually_corrected_datasets)} manually corrected datasets (in memory):")
+
+            for i, manual_dataset in enumerate(manually_corrected_datasets):
+                combined_gt_dataset = combined_gt_dataset + manual_dataset
+                print(f"  Merged manual dataset {i + 1}: total GT size now {len(combined_gt_dataset)}")
+
+            print(
+                f"✓ Total GT dataset (in memory): {len(initial_dataset)} initial + {total_manual_images} manual = {len(combined_gt_dataset)} images")
         else:
-            label_map = initial_dataset.targets.generate_label_map()
+            print("No manually corrected datasets found. Using only initial annotations.")
 
+        # Step 4: Now add the current pseudo-labeled dataset
+        print(f"✓ Adding current pseudo-labeled dataset: {len(pseudo_dataset)} images")
+
+        # Step 5: Ensure label map consistency
+        if combined_gt_dataset.targets.has_frozen_label_map():
+            label_map = combined_gt_dataset.targets.get_frozen_label_map()
+        elif combined_gt_dataset.targets.has_frozen_labels():
+            label_map = LabelMap.from_labels(combined_gt_dataset.targets.get_frozen_labels())
+        else:
+            label_map = combined_gt_dataset.targets.generate_label_map()
+
+        print(f"Using label map: {label_map}")
         pseudo_dataset.targets.freeze_label_map(label_map)
 
-        # Convert to ObjectIDColumn and merge
-        initial_dataset.targets = ObjectIDColumn(initial_dataset.targets)
+        # Step 6: Convert to ObjectIDColumn and merge
+        combined_gt_dataset.targets = ObjectIDColumn(combined_gt_dataset.targets)
         pseudo_dataset.targets = ObjectIDColumn(pseudo_dataset.targets)
 
-        # Merge: Initial annotations + Current pseudo-labels (which include updated past data)
-        merged = initial_dataset + pseudo_dataset
-        self.client.datasets.save(self.train_dataset_name, merged, exist="versions", skip_validation=True)
+        # Final merge: All GT data + Current pseudo-labels (ONLY save the training dataset)
+        final_merged = combined_gt_dataset + pseudo_dataset
+        self.client.datasets.save(self.train_dataset_name, final_merged, exist="versions", skip_validation=True)
         self.client.datasets.push(self.train_dataset_name, push_policy="version")
 
-        print(
-            f"Merged datasets into '{self.train_dataset_name}': {len(initial_dataset)} initial + {len(pseudo_dataset)} pseudo = {len(merged)} total")
+        print(f"\n✓ FINAL MERGE COMPLETE:")
+        print(f"  - GT images (initial + manual): {len(combined_gt_dataset)}")
+        print(f"  - Pseudo images (current): {len(pseudo_dataset)}")
+        print(f"  - Total training dataset: {len(final_merged)}")
+        print(f"  - Saved as: {self.train_dataset_name}")
+        print(f"  - Original initial dataset kept clean: {self.initial_annotated_dataset_name}")
+        print("=" * 50)
 
     def train_model(self):
         """Train model on current dataset with logging."""
