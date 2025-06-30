@@ -168,7 +168,7 @@ class DatabaseManager:
         return result[0] > 0
 
     def log_iteration_0(self, **kwargs):
-        """Log iteration 0 to the database (legacy method for compatibility)."""
+        """Log iteration 0 to the database."""
         train_cfg_str = str(kwargs.get('train_cfg')) if kwargs.get('train_cfg') is not None else None
 
         self.cursor.execute('''
@@ -181,8 +181,8 @@ class DatabaseManager:
                 pseudo_input_dataset_name, pseudo_output_dataset_name,
                 inference_model_uid, model_uid, evaluation_uid, evaluation_info,
                 manual_correction, cvat_project_id, train_cfg,
-                completed_timestamp
-            ) VALUES (?, ?, 'COMPLETED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                timestamp, completed_timestamp
+            ) VALUES (?, ?, 'COMPLETED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             kwargs['flow_id'], kwargs['iteration'],
             kwargs['num_gt_images'], kwargs['num_gt_images_added'],
@@ -192,10 +192,40 @@ class DatabaseManager:
             kwargs['pseudo_input_dataset_name'], kwargs['pseudo_output_dataset_name'],
             kwargs['inference_model_uid'], kwargs['model_uid'], kwargs['evaluation_uid'], kwargs['evaluation_info'],
             kwargs['manual_correction'], kwargs['cvat_project_id'], train_cfg_str,
-            time.strftime('%Y-%m-%d %H:%M:%S')
+            time.strftime('%Y-%m-%d %H:%M:%S'),  # timestamp
+            time.strftime('%Y-%m-%d %H:%M:%S')  # completed_timestamp
         ))
         self.conn.commit()
 
+    def log_iteration_0_external_model(self, **kwargs):
+        """Log iteration 0 with external model to the database."""
+        train_cfg_str = str(kwargs.get('train_cfg')) if kwargs.get('train_cfg') is not None else None
+
+        self.cursor.execute('''
+            INSERT OR REPLACE INTO iteration_metadata (
+                flow_id, iteration, status,
+                num_gt_images, num_gt_images_added,
+                num_pseudo_images, num_pseudo_images_added,
+                total_train_size,
+                main_dataset, validation_set, train_dataset,
+                pseudo_input_dataset_name, pseudo_output_dataset_name,
+                inference_model_uid, model_uid, evaluation_uid, evaluation_info,
+                manual_correction, cvat_project_id, train_cfg,
+                timestamp, completed_timestamp
+            ) VALUES (?, ?, 'COMPLETED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            kwargs['flow_id'], kwargs['iteration'],
+            kwargs['num_gt_images'], kwargs['num_gt_images_added'],
+            kwargs['num_pseudo_images'], kwargs['num_pseudo_images_added'],
+            kwargs['total_train_size'],
+            kwargs['main_dataset'], kwargs['validation_dataset'], kwargs['train_dataset'],
+            kwargs['pseudo_input_dataset_name'], kwargs['pseudo_output_dataset_name'],
+            kwargs['inference_model_uid'], kwargs['model_uid'], kwargs['evaluation_uid'], kwargs['evaluation_info'],
+            kwargs['manual_correction'], kwargs['cvat_project_id'], train_cfg_str,
+            time.strftime('%Y-%m-%d %H:%M:%S'),  # timestamp
+            time.strftime('%Y-%m-%d %H:%M:%S')  # completed_timestamp
+        ))
+        self.conn.commit()
 
 class CVATManager:
     """Handles CVAT API operations and annotation management."""
@@ -380,117 +410,6 @@ class CVATManager:
         if attempt >= max_attempts:
             print("Timeout waiting for annotation import. Check CVAT manually.")
 
-    def get_task_by_name(self, project_id, task_name):
-        """Find task ID by name within a project."""
-        resp = self.session.get(f"{self.cvat_api_url}/tasks")
-        if resp.status_code == 200:
-            tasks = resp.json()["results"]
-            for task in tasks:
-                if task["project_id"] == project_id and task["name"] == task_name:
-                    return task["id"]
-        return None
-
-    def export_annotations(self, task_id, export_path, format_name="COCO 1.0"):
-        """Export annotations from CVAT task using the new API."""
-        # Step 1: Initiate export
-        url = f"{self.cvat_api_url}/tasks/{task_id}/dataset/export"
-        params = {"save_images": "false", "format": format_name}
-
-        print(f"Initiating export of annotations from CVAT task {task_id}...")
-        resp = self.session.post(url, params=params)
-
-        if resp.status_code != 202:
-            raise RuntimeError(f"CVAT export initiation failed: {resp.status_code} - {resp.text}")
-
-        rq_id = resp.json().get("rq_id")
-        print(f"Export initiated. Request ID: {rq_id}")
-
-        # Step 2: Wait for export to complete and get download URL
-        download_url = self._wait_for_export_completion(rq_id)
-
-        # Step 3: Download the exported file
-        return self._download_exported_file(download_url, export_path)
-
-    def _wait_for_export_completion(self, rq_id):
-        """Wait for export to complete and return download URL."""
-        url = f"{self.cvat_api_url}/requests/{rq_id}"
-        print("Waiting for export to complete...")
-        max_attempts = 600
-        attempt = 0
-
-        while attempt < max_attempts:
-            resp = self.session.get(url)
-            if resp.status_code != 200:
-                raise RuntimeError(f"Failed to check export status: {resp.text}")
-
-            status_data = resp.json()
-            state = status_data.get("state")
-
-            if state == "finished":
-                result_url = status_data.get("result_url")
-                if result_url:
-                    print("Export completed successfully.")
-                    return result_url
-                else:
-                    raise RuntimeError("Export finished but no result URL provided")
-            elif state == "failed":
-                error_msg = status_data.get("message", "Unknown error")
-                raise RuntimeError(f"CVAT export failed: {error_msg}")
-            else:
-                print(f"Export in progress... State: {state} (attempt {attempt + 1}/{max_attempts})")
-                time.sleep(5)
-                attempt += 1
-
-        raise RuntimeError("Timeout waiting for export to complete")
-
-    def _download_exported_file(self, download_url, export_path):
-        """Download the exported file and extract annotations."""
-        print("Downloading exported annotations...")
-
-        # Download the file
-        resp = self.session.get(download_url)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Failed to download export: {resp.status_code} - {resp.text}")
-
-        # Save as temporary zip file
-        import tempfile
-        import zipfile
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as temp_file:
-            temp_file.write(resp.content)
-            temp_zip_path = temp_file.name
-
-        try:
-            # Extract the zip file
-            with zipfile.ZipFile(temp_zip_path, 'r') as zip_ref:
-                # Find the annotations file in the zip
-                annotation_files = [f for f in zip_ref.namelist() if f.endswith('instances_default.json')]
-
-                if not annotation_files:
-                    raise RuntimeError("No COCO annotation file found in export")
-
-                annotation_file = annotation_files[0]
-
-                # Define the target path
-                export_file = export_path / "annotations" / "instances_default.json"
-                export_file.parent.mkdir(parents=True, exist_ok=True)
-
-                # Delete existing file if it exists (no backup needed)
-                if export_file.exists():
-                    os.remove(export_file)
-                    print(f"Deleted existing annotation file: {export_file}")
-
-                # Extract and save the annotation file
-                with zip_ref.open(annotation_file) as source, open(export_file, 'wb') as target:
-                    target.write(source.read())
-
-                print(f"Annotations exported and replaced successfully: {export_file}")
-                return str(export_file)
-
-        finally:
-            # Clean up temporary file
-            os.unlink(temp_zip_path)
-
 
 class PseudoLabelingPipeline:
     """
@@ -555,7 +474,7 @@ class PseudoLabelingPipeline:
                 self.current_iteration = last_any + 1  # Start next iteration
             else:
                 self.current_iteration = last_any  # Resume incomplete iteration
-                print(f"⚠️  Resuming incomplete iteration {self.current_iteration} (status: {current_status})")
+                print(f"Resuming incomplete iteration {self.current_iteration} (status: {current_status})")
 
         # models and eval
         self.train_cfg = None
@@ -618,6 +537,7 @@ class PseudoLabelingPipeline:
 
         print(f"Ready for iteration {self.current_iteration}")
         print("=" * 60)
+
 
     def _get_dataset_labels(self):
         """Extract labels from the initial annotated dataset."""
@@ -771,7 +691,7 @@ class PseudoLabelingPipeline:
     # ========== FLOW SETUP METHODS ==========
 
     def setup_next_iteration(self, manual_corrections, current_flow=None):
-        """Set up the next iteration for the current flow with status validation."""
+        """Set up the next iteration with persistent dataset architecture."""
 
         # If current_flow is provided, set up flow variables (for kernel restart scenarios)
         if current_flow is not None:
@@ -781,45 +701,47 @@ class PseudoLabelingPipeline:
 
         # Ensure flow_id is set
         if self.flow_id is None:
-            raise RuntimeError(
-                "Flow ID not set. Please provide current_flow parameter or run setup_initial_flow first.")
+            raise RuntimeError("Flow ID not set. Please provide current_flow parameter.")
 
-        # Check if current iteration is complete before proceeding
-        if self.current_iteration > 0:
-            current_status = self.db.get_iteration_status(self.flow_id, self.current_iteration)
-            if current_status == 'COMPLETED':
-                # Move to next iteration
-                self.current_iteration += 1
-                print(f"Previous iteration completed. Moving to iteration {self.current_iteration}")
-            elif current_status is None:
-                # This shouldn't happen, but handle gracefully
-                print(f"No status found for iteration {self.current_iteration}. Proceeding...")
+        # Check if current iteration is complete before proceeding (INCLUDING ITERATION 0)
+        current_status = self.db.get_iteration_status(self.flow_id, self.current_iteration)
+        if current_status == 'COMPLETED':
+            self.current_iteration += 1
+            print(
+                f"Previous iteration {self.current_iteration - 1} completed. Moving to iteration {self.current_iteration}")
+        elif current_status is None:
+            print(f"No status found for iteration {self.current_iteration}. Proceeding...")
+        elif current_status != 'COMPLETED' and self.current_iteration > 0:
+            print(f"Current iteration {self.current_iteration} status: {current_status}")
+            user_input = input("Do you want to restart this iteration? (y/n): ").lower().strip()
+            if user_input == 'y':
+                print(f"Restarting iteration {self.current_iteration}")
             else:
-                print(f"Current iteration {self.current_iteration} status: {current_status}")
-                user_input = input("Do you want to restart this iteration? (y/n): ").lower().strip()
-                if user_input == 'y':
-                    print(f"Restarting iteration {self.current_iteration}")
-                else:
-                    print("Continuing with current iteration...")
+                print("Continuing with current iteration...")
 
         self.manual_corrections_global = manual_corrections
 
         # Get the last completed iteration for the specified flow
         last_completed = self.db.get_last_completed_iteration(self.flow_id)
-        if last_completed is None and self.current_iteration > 0:
-            raise RuntimeError(f"No completed iteration history found for flow: {self.flow_id}")
 
-        # For iteration 0, use initial dataset; for others, get previous model data
-        if self.current_iteration == 0:
+        # Handle iteration progression properly
+        if self.current_iteration == 0 and last_completed is None:
+            # This is a brand new flow, no completed iterations yet
             previous_gt_total = 0
             previous_pseudo_total = 0
             self.inference_model_uid = ""
-        else:
-            # Get previous model UID and image counts
+        elif self.current_iteration > 0:
+            # For iterations 1+, get model data from the previous iteration
             result = self.db.get_previous_model_data(self.flow_id, self.current_iteration - 1)
             if result is None:
                 raise RuntimeError(
                     f"No model metadata found for {self.flow_id} @ iteration {self.current_iteration - 1}")
+            self.inference_model_uid, previous_gt_total, previous_pseudo_total = result
+        else:
+            # Iteration 0 exists and is completed, we're setting up iteration 1
+            result = self.db.get_previous_model_data(self.flow_id, 0)
+            if result is None:
+                raise RuntimeError(f"No model metadata found for {self.flow_id} @ iteration 0")
             self.inference_model_uid, previous_gt_total, previous_pseudo_total = result
 
         # Define image additions based on correction mode
@@ -834,8 +756,18 @@ class PseudoLabelingPipeline:
         self.num_pseudo_images_after_iter = previous_pseudo_total + self.num_pseudo_images_added
         total_train_size = self.num_gt_images_after_iter + self.num_pseudo_images_after_iter
 
-        # Define dataset names
-        self.pseudo_input_dataset_name = f"pseudo-iter{self.current_iteration}-{self.flow_id}"
+        # Define dataset names - NEW PERSISTENT ARCHITECTURE
+        self.persistent_pseudo_dataset_name = f"pseudo-{self.flow_id}"  # Persistent pseudo dataset
+        self.manual_corrections_dataset_name = f"manual-corrections-{self.flow_id}"  # Persistent manual corrections
+
+        if manual_corrections:
+            # For manual corrections: temp folder -> manual corrections dataset
+            self.pseudo_input_dataset_name = f"temp-cvat-iter{self.current_iteration}-{self.flow_id}"
+            self.predicted_dataset_name = self.manual_corrections_dataset_name  # Will be updated/created
+        else:
+            # For auto pseudo-labeling: persistent pseudo -> inference output
+            self.pseudo_input_dataset_name = self.persistent_pseudo_dataset_name
+            self.predicted_dataset_name = None  # Will be set by inference
 
         # Initialize the iteration in the database
         self.db.initialize_iteration(
@@ -857,7 +789,7 @@ class PseudoLabelingPipeline:
 
         # Enhanced output formatting
         print("-" * 40)
-        print("ITERATION INITIALIZED")
+        print("ITERATION INITIALIZED - PERSISTENT ARCHITECTURE")
         print("=" * 40)
         print(f"Flow ID: {self.flow_id}")
         print(f"Current iteration: {self.current_iteration}")
@@ -869,10 +801,103 @@ class PseudoLabelingPipeline:
         print(f"Total pseudo-labeled images after this step: {self.num_pseudo_images_after_iter}")
         print(f"Total expected training set size: {total_train_size}")
         print(f"Train dataset name: {self.train_dataset_name}")
-        print(f"Pseudo input dataset name: {self.pseudo_input_dataset_name}")
-        print(f"Using initial annotations: {self.initial_annotated_dataset_name}")
+        print(f"Persistent pseudo dataset: {self.persistent_pseudo_dataset_name}")
+        print(f"Manual corrections dataset: {self.manual_corrections_dataset_name}")
+        print(f"Pseudo input dataset: {self.pseudo_input_dataset_name}")
+        print(f"Initial annotations: {self.initial_annotated_dataset_name}")
         print(f"Inference model UID: {self.inference_model_uid}")
         print("-" * 40)
+
+    def set_pseudo_dataset_for_inference(self, dataset_name, model_uid=None):
+        """
+        Set an existing dataset as the pseudo input dataset for inference, bypassing sampling.
+        This allows you to use pre-existing datasets for inference without sampling new data.
+
+        Args:
+            dataset_name (str): Name of the existing dataset to use for inference
+            model_uid (str, optional): Model UID to use for inference. If not provided,
+                                     uses the current inference_model_uid
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Verify the dataset exists
+            test_dataset = self.client.datasets.load(dataset_name, pull_policy="missing")
+            print(f"✓ Dataset '{dataset_name}' found with {len(test_dataset)} images")
+
+            # Set the pseudo input dataset name
+            if self.manual_corrections_global:
+                # For manual corrections mode
+                self.pseudo_input_dataset_name = dataset_name
+                print(f"✓ Set pseudo input dataset for manual corrections: {dataset_name}")
+            else:
+                # For auto pseudo-labeling mode
+                self.persistent_pseudo_dataset_name = dataset_name
+                self.pseudo_input_dataset_name = dataset_name
+                print(f"✓ Set persistent pseudo dataset for inference: {dataset_name}")
+
+            # Set model UID if provided
+            if model_uid is not None:
+                self.set_inference_model_uid(model_uid)
+
+            # Update database with the dataset information
+            self.db.update_iteration_field(
+                self.flow_id, self.current_iteration,
+                pseudo_input_dataset_name=self.pseudo_input_dataset_name,
+                status='PRE_INFERENCE'  # New status to indicate ready for inference
+            )
+
+            print(f"✓ Ready to run inference on dataset: {dataset_name}")
+            if self.inference_model_uid:
+                print(f"✓ Using model: {self.inference_model_uid}")
+            else:
+                print("⚠ Warning: No inference model UID set. Use set_inference_model_uid() before running inference.")
+
+            return True
+
+        except Exception as e:
+            print(f"✗ Error setting pseudo dataset: {e}")
+            return False
+
+    def setup_iteration_with_existing_data(self, manual_corrections, dataset_name, model_uid, current_flow=None):
+        """
+        Convenience function to set up a new iteration with existing dataset and model.
+        This combines setup_next_iteration() with set_pseudo_dataset_for_inference().
+
+        Args:
+            manual_corrections (bool): Whether this iteration uses manual corrections
+            dataset_name (str): Name of existing dataset to use
+            model_uid (str): Model UID to use for inference
+            current_flow (int, optional): Flow number if needed for kernel restart scenarios
+
+        Returns:
+            bool: True if setup successful, False otherwise
+        """
+        try:
+            # First set up the iteration
+            self.setup_next_iteration(manual_corrections, current_flow)
+
+            # Then set the existing dataset and model
+            success = self.set_pseudo_dataset_for_inference(dataset_name, model_uid)
+
+            if success:
+                print("\n" + "=" * 50)
+                print("ITERATION SETUP COMPLETE WITH EXISTING DATA")
+                print("=" * 50)
+                print(f"Flow: {self.flow_id}")
+                print(f"Iteration: {self.current_iteration}")
+                print(f"Mode: {'Manual Corrections' if manual_corrections else 'Auto Pseudo-labeling'}")
+                print(f"Dataset: {dataset_name}")
+                print(f"Model: {model_uid}")
+                print(f"Status: Ready for inference")
+                print("=" * 50)
+
+            return success
+
+        except Exception as e:
+            print(f"✗ Error in iteration setup: {e}")
+            return False
 
     def set_inference_model_uid(self, model_uid):
         """Set the inference model UID manually."""
@@ -889,115 +914,71 @@ class PseudoLabelingPipeline:
 
     def sample_unseen_inputs(self):
         """
-        Enhanced sampling function with continuous logging and validation.
-        Now includes deduplication to avoid counting the same images multiple times.
+        Sample new images and prepare them for either manual correction or pseudo-labeling.
+        Uses persistent dataset architecture.
         """
-        print(f"\n=== ENHANCED SAMPLING FOR ITERATION {self.current_iteration} ===")
+        print(f"\n=== PERSISTENT ARCHITECTURE SAMPLING FOR ITERATION {self.current_iteration} ===")
 
-        # Update status
         self.db.update_status(self.flow_id, self.current_iteration, 'SAMPLING')
 
-        # VALIDATION: Check if inference_model_uid is set for iterations > 0
         if self.current_iteration > 0 and (self.inference_model_uid is None or self.inference_model_uid == ""):
-            raise ValueError(
-                f"Inference model UID not set for iteration {self.current_iteration}. "
-                f"Please call set_inference_model_uid() with the model from iteration {self.current_iteration - 1}, "
-                f"or ensure setup_next_iteration() was called properly."
-            )
+            raise ValueError(f"Inference model UID not set for iteration {self.current_iteration}.")
 
-        # Step 1: Load initial annotations (shared across all flows)
+        # Step 1: Load training dataset to see what's already used
         try:
-            initial_dataset = self.client.datasets.load(self.initial_annotated_dataset_name, pull_policy="missing")
-            print(f"✓ Loaded initial annotations: {len(initial_dataset)} images")
+            current_training = self.client.datasets.load(self.train_dataset_name, pull_policy="missing")
+            training_hashes = set(current_training.inputs.hash_iterator())
+            print(f"✓ Current training dataset has {len(current_training)} images")
         except Exception as e:
-            print(f"✗ Could not load initial annotations {self.initial_annotated_dataset_name}: {e}")
+            print(f"✗ Could not load training dataset {self.train_dataset_name}: {e}")
             raise
 
-        # Step 2: Sample new unseen inputs for current iteration
+        # Step 2: Find images NOT in training dataset (disjoint set)
         full_hashes = list(self.full_dataset.inputs.hash_iterator())
-        initial_hashes = set(initial_dataset.inputs.hash_iterator())
-        remaining_hashes = list(set(full_hashes) - initial_hashes)
+        unused_hashes = list(set(full_hashes) - training_hashes)
 
-        if len(remaining_hashes) < self.sample_size_per_iter:
+        print(f"Total images in full dataset: {len(full_hashes)}")
+        print(f"Images already in training: {len(training_hashes)}")
+        print(f"Images NOT in training (available): {len(unused_hashes)}")
+
+        if len(unused_hashes) < self.sample_size_per_iter:
             raise ValueError(
-                f"Only {len(remaining_hashes)} unseen images left, but {self.sample_size_per_iter} requested.")
+                f"Only {len(unused_hashes)} unused images available, but {self.sample_size_per_iter} requested.")
 
-        # Sample new images for this iteration
-        sampled_hashes = random.sample(remaining_hashes, self.sample_size_per_iter)
+        # Step 3: Sample new images from unused set
+        sampled_hashes = random.sample(unused_hashes, self.sample_size_per_iter)
         index_map = {h: i for i, h in enumerate(full_hashes)}
         sampled_indices = [index_map[h] for h in sampled_hashes]
         new_sampled_data = self.full_dataset[sampled_indices]
 
-        # Create input-only dataset for new samples
-        new_input_dataset = Dataset(inputs=new_sampled_data.inputs)
-        print(f"✓ Sampled {self.sample_size_per_iter} new images for iteration {self.current_iteration}")
+        print(f"✓ Sampled {self.sample_size_per_iter} new images from unused set")
 
-        # Step 3: Find ALL past pseudo-labeled datasets from this flow
-        self.db.cursor.execute('''
-            SELECT iteration, pseudo_input_dataset_name, manual_correction
-            FROM iteration_metadata
-            WHERE flow_id = ? AND iteration < ? AND manual_correction = 0 AND status = 'COMPLETED'
-            ORDER BY iteration
-        ''', (self.flow_id, self.current_iteration))
+        if self.manual_corrections_global:
+            # Step 4a: For manual corrections - create temp dataset for CVAT export
+            temp_dataset = Dataset(inputs=new_sampled_data.inputs)
+            self.client.datasets.save(self.pseudo_input_dataset_name, temp_dataset, exist="overwrite")
+            self.client.datasets.push(self.pseudo_input_dataset_name, push_policy="version")
+            print(f"✓ Created temp dataset for CVAT: {self.pseudo_input_dataset_name}")
 
-        past_pseudo_results = self.db.cursor.fetchall()
-
-        # Step 4: Load and deduplicate past pseudo datasets
-        all_past_hashes = set()
-        deduplicated_past_datasets = []
-
-        for past_iter, past_dataset_name, was_manual in past_pseudo_results:
-            if past_dataset_name and past_dataset_name.strip():
-                try:
-                    print(f"  Loading past pseudo dataset: {past_dataset_name} (iteration {past_iter})")
-                    past_dataset = self.client.datasets.load(past_dataset_name, pull_policy="missing")
-
-                    # Get hashes for this dataset
-                    dataset_hashes = set(past_dataset.inputs.hash_iterator())
-                    unique_hashes = dataset_hashes - all_past_hashes
-
-                    if unique_hashes:
-                        # Keep only unique images from this dataset
-                        hash_to_index = {h: i for i, h in enumerate(past_dataset.inputs.hash_iterator())}
-                        unique_indices = [hash_to_index[h] for h in unique_hashes]
-                        unique_dataset = Dataset(inputs=past_dataset.inputs[unique_indices])
-                        deduplicated_past_datasets.append(unique_dataset)
-                        all_past_hashes.update(unique_hashes)
-
-                        print(f"Added {len(unique_dataset)} unique images from iteration {past_iter} "
-                              f"(skipped {len(dataset_hashes) - len(unique_hashes)} duplicates)")
-                    else:
-                        print(
-                            f"All {len(dataset_hashes)} images from iteration {past_iter} were duplicates - skipped")
-
-                except Exception as e:
-                    print(f"Warning: Could not load {past_dataset_name}: {e}")
-
-        # Step 5: Merge new samples with deduplicated past datasets
-        combined_dataset = new_input_dataset
-
-        if deduplicated_past_datasets:
-            print(f"\nMerging new samples with {len(deduplicated_past_datasets)} deduplicated past datasets:")
-
-            for i, past_dataset in enumerate(deduplicated_past_datasets):
-                combined_dataset = combined_dataset + past_dataset
-                print(f"  Merged dataset {i + 1}: total size now {len(combined_dataset)}")
-
-            total_images = len(combined_dataset)
-            past_images = total_images - self.sample_size_per_iter
-            print(
-                f"\n✓ Final combined dataset: {self.sample_size_per_iter} new + {past_images} unique past = {total_images} total images")
         else:
-            print(f"No past pseudo datasets found. Using only {len(combined_dataset)} new samples.")
+            # Step 4b: For pseudo-labeling - add to persistent pseudo dataset
+            try:
+                existing_pseudo = self.client.datasets.load(self.persistent_pseudo_dataset_name, pull_policy="missing")
+                print(f"✓ Found existing pseudo dataset with {len(existing_pseudo)} images")
+                updated_pseudo_dataset = existing_pseudo + Dataset(inputs=new_sampled_data.inputs)
+                print(
+                    f"✓ Merged: {len(existing_pseudo)} existing + {len(new_sampled_data)} new = {len(updated_pseudo_dataset)} total")
+            except Exception as e:
+                print(f"No existing pseudo dataset found: {e}")
+                updated_pseudo_dataset = Dataset(inputs=new_sampled_data.inputs)
+                print(f"✓ Created new persistent pseudo dataset with {len(updated_pseudo_dataset)} images")
 
-        # Step 6: Save the combined dataset for inference
-        self.client.datasets.save(self.pseudo_input_dataset_name, dataset=combined_dataset, exist="overwrite")
-        self.client.datasets.push(self.pseudo_input_dataset_name, push_policy="version")
+            # Save updated persistent pseudo dataset
+            self.client.datasets.save(self.persistent_pseudo_dataset_name, updated_pseudo_dataset, exist="version")
+            self.client.datasets.push(self.persistent_pseudo_dataset_name, push_policy="version")
+            print(f"✓ Updated persistent pseudo dataset: {self.persistent_pseudo_dataset_name}")
 
-        print(
-            f"✓ Saved combined dataset '{self.pseudo_input_dataset_name}' with {len(combined_dataset)} images for inference")
-
-        # Update database with sampling completion
+        # Update database
         self.db.update_iteration_field(
             self.flow_id, self.current_iteration,
             pseudo_input_dataset_name=self.pseudo_input_dataset_name,
@@ -1005,32 +986,39 @@ class PseudoLabelingPipeline:
         )
 
     def run_inference(self):
-        """Run inference on pseudo input dataset to generate predictions with logging."""
+        """Run inference on the appropriate dataset based on mode."""
         if self.inference_model_uid is None:
             raise ValueError("Inference model UID not set. Use set_inference_model_uid() first.")
 
         print(f"Running inference with model: {self.inference_model_uid}")
         self.db.update_status(self.flow_id, self.current_iteration, 'INFERENCE')
 
-        config = EvaluationConfig(
-            model_name=self.inference_model_uid,
-            dataset_name=self.pseudo_input_dataset_name,
-            report_template=REPORT_TEMPLATE.EMPTY,
-            batch_size=1
-        )
+        # Use persistent pseudo dataset for inference (only for non-manual mode)
+        if not self.manual_corrections_global:
+            pseudo_inference_dataset = self.persistent_pseudo_dataset_name
+            print(f"Running inference on persistent pseudo dataset: {pseudo_inference_dataset}")
 
-        job = self.client.jobs.submit(config)
-        self.predicted_dataset_name = self.client.jobs.get_dataset(job)
+            config = EvaluationConfig(
+                model_name=self.inference_model_uid,
+                dataset_name=pseudo_inference_dataset,
+                report_template=REPORT_TEMPLATE.EMPTY,
+                batch_size=1
+            )
 
-        print(f"Inference complete")
-        print(f"Predictions saved as: {self.predicted_dataset_name}")
+            job = self.client.jobs.submit(config)
+            self.predicted_dataset_name = self.client.jobs.get_dataset(job)
 
-        # Update database
-        self.db.update_iteration_field(
-            self.flow_id, self.current_iteration,
-            pseudo_output_dataset_name=self.predicted_dataset_name,
-            status='INFERENCE_COMPLETE'
-        )
+            print(f"Inference complete")
+            print(f"Predictions saved as: {self.predicted_dataset_name}")
+
+            # Update database
+            self.db.update_iteration_field(
+                self.flow_id, self.current_iteration,
+                pseudo_output_dataset_name=self.predicted_dataset_name,
+                status='INFERENCE_COMPLETE'
+            )
+        else:
+            print("Manual corrections mode - skipping inference step")
 
     def set_predicted_dataset(self, dataset_name):
         """Manually set the predicted dataset name with logging."""
@@ -1223,138 +1211,326 @@ class PseudoLabelingPipeline:
         except Exception as e:
             print(f"Error during CVAT upload: {e}")
 
-    def merge_pseudo_labels(self):
+    def merge_pseudo_labels(self, manual_annotation_path=None, pseudo_only=False):
         """
         Merge pseudo-labeled predictions into the training dataset with logging.
+
+        Args:
+            manual_annotation_path (str, optional): Path to manually corrected COCO annotation file.
+            pseudo_only (bool): If True, train only on pseudo-labels (skip initial dataset)
         """
         print("Starting merge process...")
         self.db.update_status(self.flow_id, self.current_iteration, 'MERGING')
 
         if self.manual_corrections_global:
-            print("Manual corrections mode - importing from CVAT and merging...")
-            self.import_cvat_corrections_and_merge()
+            if manual_annotation_path is None:
+                raise ValueError(
+                    "Manual corrections mode requires manual_annotation_path parameter.\n"
+                    "Please provide the path to your corrected COCO annotation file."
+                )
+            print("Manual corrections mode - using provided annotation file...")
+            self._use_manual_annotation_file_and_merge(manual_annotation_path)
         else:
             print("Automated mode - merging pseudo-labels directly...")
-            self._merge_automated_pseudo_labels()
+            self._rebuild_training_dataset(pseudo_only=pseudo_only)
 
         # Update status after successful merge
         self.db.update_status(self.flow_id, self.current_iteration, 'MERGE_COMPLETE')
 
-    def import_cvat_corrections_and_merge(self):
-        """Import corrected annotations from CVAT and merge with training dataset."""
-        if not self.manual_corrections_global:
-            print("Manual corrections not enabled - using automated pseudo-labels")
-            self._merge_automated_pseudo_labels()
-            return
-
-        # Ask user if they have annotations ready or need to download from CVAT
-        print("\nANNOTATION SOURCE OPTIONS:")
-        print("1. Download corrected annotations from CVAT automatically")
-        print("2. Use existing annotation file (manual path)")
-
-        choice = input("\nChoose option (1 or 2): ").strip()
-
-        if choice == "1":
-            # Original CVAT download workflow
-            self._download_from_cvat_and_merge()
-        elif choice == "2":
-            # Manual file path workflow
-            self._use_manual_annotation_file_and_merge()
-        else:
-            print("Invalid choice. Please run again and select 1 or 2.")
-            return
-
-    def _download_from_cvat_and_merge(self):
-        """Download annotations from CVAT and merge with training dataset."""
-        # Get user input for CVAT import
-        username = input("CVAT Username: ")
-        password = input("CVAT Password: ")
-        project_name = input(f"CVAT Project Name (default: {self.flow_id}-project): ") or f"{self.flow_id}-project"
-        task_name = input(
-            f"CVAT Task Name (default: {self.flow_id}-iter{self.current_iteration}-corrections): ") or f"{self.flow_id}-iter{self.current_iteration}-corrections"
-
-        try:
-            # Set up paths
-            export_path = Path(self.local_path) / f"cvat_export_iter_{self.current_iteration}"
-
-            # Authenticate with CVAT
-            self.cvat.authenticate(username, password)
-
-            # Get project and task IDs
-            dataset_labels = self._get_dataset_labels()
-            project_id = self.cvat.get_or_create_project(project_name, dataset_labels)
-            task_id = self.cvat.get_task_by_name(project_id, task_name)
-
-            if task_id is None:
-                raise RuntimeError(f"Task '{task_name}' not found in project '{project_name}'")
-
-            print(f"Found CVAT task: {task_name} (ID: {task_id})")
-
-            # Export corrected annotations from CVAT - this will replace the existing file
-            corrected_annotation_file = self.cvat.export_annotations(task_id, export_path)
-
-            # Continue with merge process
-            self._import_and_merge_annotations(export_path)
-
-        except Exception as e:
-            print(f"CVAT import failed: {e}")
-            print("Please check CVAT task exists and try again.")
-
-    def _use_manual_annotation_file_and_merge(self):
-        """Use manually provided annotation file and merge with training dataset."""
-        print("\nMANUAL ANNOTATION FILE")
-        print("Please provide the path to your corrected COCO annotation file.")
-        print("Example: /path/to/your/annotations/instances_default.json")
-
-        annotation_file_path = input("\nPath to annotation file: ").strip()
-
-        if not annotation_file_path:
-            print("No path provided. Cancelling operation.")
-            return
-
+    def _use_manual_annotation_file_and_merge(self, annotation_file_path):
+        """Use manually provided annotation file and update persistent manual corrections' dataset."""
         annotation_file = Path(annotation_file_path)
 
-        # Validate the file exists
+        # Validate the file exists and is valid JSON
         if not annotation_file.exists():
-            print(f"File not found: {annotation_file}")
-            return
-
-        # Validate it's a JSON file
+            raise FileNotFoundError(f"Annotation file not found: {annotation_file}")
         if not annotation_file.name.endswith('.json'):
-            print(f"File must be a JSON file. Got: {annotation_file.name}")
-            return
+            raise ValueError(f"File must be a JSON file. Got: {annotation_file.name}")
 
         try:
-            # Validate it's valid JSON by trying to load it
             with open(annotation_file, 'r') as f:
                 json.load(f)
             print(f"Valid JSON file found: {annotation_file}")
         except json.JSONDecodeError as e:
-            print(f"Invalid JSON file: {e}")
-            return
-        except Exception as e:
-            print(f"Error reading file: {e}")
-            return
+            raise ValueError(f"Invalid JSON file: {e}")
 
-        # Set up the export path (where our original export was)
+        # Set up the export path for temp processing
         export_path = Path(self.local_path) / f"cvat_export_iter_{self.current_iteration}"
         target_annotation_file = export_path / "annotations" / "instances_default.json"
-
-        # Create the annotations directory if it doesn't exist
         target_annotation_file.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Copy the user's annotation file to replace our existing one
             import shutil
             shutil.copy2(annotation_file, target_annotation_file)
             print(f"Copied annotation file to: {target_annotation_file}")
 
-            # Continue with merge process
-            self._import_and_merge_annotations(export_path)
+            # Import the corrected annotations
+            print("Importing corrected annotations...")
+            corrected_dataset = Dataset.import_coco(
+                path=str(export_path),
+                image_subdir="images",
+                coco_filename="annotations/instances_default.json"
+            )
+
+            # Add to persistent manual corrections dataset
+            try:
+                existing_manual = self.client.datasets.load(self.manual_corrections_dataset_name, pull_policy="missing")
+                print(f"✓ Found existing manual corrections with {len(existing_manual)} images")
+                updated_manual_dataset = existing_manual + corrected_dataset
+                print(f"✓ Added {len(corrected_dataset)} new corrections to existing dataset")
+            except Exception as e:
+                print(f"No existing manual corrections found: {e}")
+                updated_manual_dataset = corrected_dataset
+                print(f"✓ Created new manual corrections dataset with {len(corrected_dataset)} images")
+
+            # Save updated manual corrections dataset
+            self.client.datasets.save(self.manual_corrections_dataset_name, updated_manual_dataset, exist="overwrite")
+            self.client.datasets.push(self.manual_corrections_dataset_name, push_policy='version')
+
+            print(f"✓ Updated persistent manual corrections dataset: {self.manual_corrections_dataset_name}")
+
+            # Update the predicted_dataset_name to point to manual corrections
+            self.predicted_dataset_name = self.manual_corrections_dataset_name
+
+            # Update database
+            self.db.update_iteration_field(
+                self.flow_id, self.current_iteration,
+                pseudo_output_dataset_name=self.predicted_dataset_name
+            )
+
+            # Now rebuild the training dataset
+            self._rebuild_training_dataset()
 
         except Exception as e:
-            print(f"Error copying annotation file: {e}")
-            return
+            raise RuntimeError(f"Error processing annotation file: {e}")
+
+    def _rebuild_training_dataset(self, pseudo_only=False):
+        """
+        Rebuild training dataset by merging:
+        1. Initial annotations (unchanged) - OPTIONAL if pseudo_only=True
+        2. Manual corrections dataset (if exists)
+        3. Current pseudo-labeled dataset with confidence filtering (if not manual mode)
+
+        Args:
+            pseudo_only (bool): If True, skip initial dataset and train only on pseudo-labels
+        """
+        print(f"\n=== REBUILDING TRAINING DATASET FOR ITERATION {self.current_iteration} ===")
+        if pseudo_only:
+            print("PSEUDO-ONLY MODE: Skipping initial annotations, training only on pseudo-labels")
+
+        # Step 1: Load initial annotations (SKIP if pseudo_only=True)
+        if not pseudo_only:
+            initial_dataset = self.client.datasets.load(self.initial_annotated_dataset_name, pull_policy="missing")
+            print(f"✓ Loaded initial annotations: {len(initial_dataset)} images")
+        else:
+            initial_dataset = None
+            print("✓ Skipped initial annotations (pseudo-only mode)")
+
+        # Step 2: Load manual corrections (if exists)
+        try:
+            manual_dataset = self.client.datasets.load(self.manual_corrections_dataset_name, pull_policy="missing")
+            print(f"✓ Loaded manual corrections: {len(manual_dataset)} images")
+            has_manual = True
+        except:
+            print("✓ No manual corrections dataset found")
+            manual_dataset = None
+            has_manual = False
+
+        # Step 3: Load and process pseudo dataset (if not in manual correction mode for this iteration)
+        if not self.manual_corrections_global:
+            try:
+                pseudo_dataset = self.client.datasets.load(self.predicted_dataset_name)
+
+                # Filter by confidence and set as targets (FIXED FOR SEMANTIC SEGMENTATION)
+                filtered_predictions = []
+                for pred in pseudo_dataset.predictions:
+                    if hasattr(pred, 'filter_by_confidence'):
+                        # Object detection/instance segmentation
+                        filtered_pred = pred.filter_by_confidence(self.min_confidence)
+                        filtered_predictions.append(filtered_pred)
+                    else:
+                        # Semantic segmentation - no confidence filtering available
+                        filtered_predictions.append(pred)
+
+                pseudo_dataset.predictions = filtered_predictions
+                pseudo_dataset.targets = pseudo_dataset.predictions
+
+                # Determine task type for logging
+                task_type = "semantic segmentation" if not hasattr(pseudo_dataset.predictions[0],
+                                                                   'filter_by_confidence') else "object/instance detection"
+                if task_type == "semantic segmentation":
+                    print(
+                        f"✓ Loaded pseudo dataset: {len(pseudo_dataset)} images (semantic segmentation - no confidence filtering)")
+                else:
+                    print(
+                        f"✓ Loaded and filtered pseudo dataset: {len(pseudo_dataset)} images (confidence >= {self.min_confidence})")
+                has_pseudo = True
+            except Exception as e:
+                print(f"No pseudo dataset found: {e}")
+                pseudo_dataset = None
+                has_pseudo = False
+        else:
+            has_pseudo = False
+            pseudo_dataset = None
+
+        # Step 4: Generate label map from GROUND TRUTH datasets only
+        label_map = None
+
+        # Try to get label map from initial dataset first (most reliable ground truth)
+        if not pseudo_only and initial_dataset is not None:
+            try:
+                if initial_dataset.targets.has_frozen_label_map():
+                    label_map = initial_dataset.targets.get_frozen_label_map()
+                elif initial_dataset.targets.has_frozen_labels():
+                    label_map = LabelMap.from_labels(initial_dataset.targets.get_frozen_labels())
+                else:
+                    label_map = initial_dataset.targets.generate_label_map()
+                print(f"Using label map from initial dataset: {label_map}")
+            except Exception as e:
+                print(f"Could not get label map from initial dataset: {e}")
+
+        # If no label map yet (pseudo_only=True case), get it from initial dataset anyway
+        # We need the label map for consistency, even if we're not using the initial dataset for training
+        if label_map is None:
+            try:
+                print("Getting label map from initial dataset for consistency (not for training)...")
+                temp_initial = self.client.datasets.load(self.initial_annotated_dataset_name, pull_policy="missing")
+                if temp_initial.targets.has_frozen_label_map():
+                    label_map = temp_initial.targets.get_frozen_label_map()
+                elif temp_initial.targets.has_frozen_labels():
+                    label_map = LabelMap.from_labels(temp_initial.targets.get_frozen_labels())
+                else:
+                    label_map = temp_initial.targets.generate_label_map()
+                print(f"Using label map from initial dataset: {label_map}")
+            except Exception as e:
+                print(f"Could not get label map from initial dataset: {e}")
+
+        # If manual corrections exist, try those as fallback (they're also ground truth)
+        if label_map is None and has_manual and manual_dataset is not None:
+            try:
+                if manual_dataset.targets.has_frozen_label_map():
+                    label_map = manual_dataset.targets.get_frozen_label_map()
+                elif manual_dataset.targets.has_frozen_labels():
+                    label_map = LabelMap.from_labels(manual_dataset.targets.get_frozen_labels())
+                else:
+                    label_map = manual_dataset.targets.generate_label_map()
+                print(f"Using label map from manual corrections: {label_map}")
+            except Exception as e:
+                print(f"Could not get label map from manual dataset: {e}")
+
+        # NEVER use pseudo dataset for label map - it's predictions, not ground truth!
+
+        # If we still don't have a label map, that's a real problem
+        if label_map is None:
+            raise RuntimeError(
+                "Could not generate label map from any ground truth dataset. "
+                f"Check that {self.initial_annotated_dataset_name} has proper target annotations."
+            )
+
+        # Step 5: Convert to ObjectIDColumn and ensure label consistency
+        if not pseudo_only and initial_dataset is not None:
+            initial_dataset.targets = ObjectIDColumn(initial_dataset.targets)
+
+        if has_manual:
+            manual_dataset.targets.freeze_label_map(label_map)
+            manual_dataset.targets = ObjectIDColumn(manual_dataset.targets)
+
+        if has_pseudo:
+            pseudo_dataset.targets.freeze_label_map(label_map)
+            pseudo_dataset.targets = ObjectIDColumn(pseudo_dataset.targets)
+
+        # Step 6: Merge datasets (FIXED FOR PSEUDO-ONLY MODE AND SEMANTIC SEGMENTATION)
+        merged_dataset = None
+
+        if pseudo_only:
+            # In pseudo-only mode, use whatever predicted dataset was set
+            if has_pseudo and pseudo_dataset is not None:
+                merged_dataset = pseudo_dataset
+                print(f"✓ Using pseudo dataset as training set: {len(merged_dataset)} images")
+            elif has_manual and manual_dataset is not None:
+                merged_dataset = manual_dataset
+                print(f"✓ Using manual corrections as training set: {len(merged_dataset)} images")
+            else:
+                # If no datasets found, create training set directly from predicted_dataset_name
+                if self.predicted_dataset_name:
+                    print(f"✓ Loading predicted dataset directly: {self.predicted_dataset_name}")
+                    try:
+                        direct_pseudo = self.client.datasets.load(self.predicted_dataset_name)
+
+                        # Filter by confidence and set as targets (FIXED FOR SEMANTIC SEGMENTATION)
+                        filtered_predictions = []
+                        for pred in direct_pseudo.predictions:
+                            if hasattr(pred, 'filter_by_confidence'):
+                                # Object detection/instance segmentation
+                                filtered_pred = pred.filter_by_confidence(self.min_confidence)
+                                filtered_predictions.append(filtered_pred)
+                            else:
+                                # Semantic segmentation - no confidence filtering available
+                                filtered_predictions.append(pred)
+
+                        direct_pseudo.predictions = filtered_predictions
+                        direct_pseudo.targets = direct_pseudo.predictions
+
+                        # Apply label map consistency
+                        direct_pseudo.targets.freeze_label_map(label_map)
+                        direct_pseudo.targets = ObjectIDColumn(direct_pseudo.targets)
+                        merged_dataset = direct_pseudo
+
+                        # Determine task type for logging
+                        task_type = "semantic segmentation" if not hasattr(direct_pseudo.predictions[0],
+                                                                           'filter_by_confidence') else "object/instance detection"
+                        print(
+                            f"✓ Created training set from predicted dataset: {len(merged_dataset)} images ({task_type})")
+                    except Exception as e:
+                        raise RuntimeError(f"Could not load predicted dataset {self.predicted_dataset_name}: {e}")
+                else:
+                    raise RuntimeError("No datasets available for pseudo-only mode. Set predicted_dataset_name first.")
+        else:
+            # Standard mode: start with initial dataset
+            if initial_dataset is not None:
+                merged_dataset = initial_dataset
+                print(f"✓ Started with initial dataset: {len(merged_dataset)} images")
+            else:
+                raise RuntimeError("Initial dataset not available for standard mode")
+
+        # Add manual corrections (if not already the base dataset)
+        if has_manual and not (pseudo_only and merged_dataset is manual_dataset):
+            merged_dataset = merged_dataset + manual_dataset
+            print(f"✓ Added manual corrections: total now {len(merged_dataset)} images")
+
+        # Add pseudo labels (if not already the base dataset) - only in standard mode
+        if not pseudo_only and has_pseudo and pseudo_dataset is not None:
+            merged_dataset = merged_dataset + pseudo_dataset
+            print(f"✓ Added pseudo labels: total now {len(merged_dataset)} images")
+
+        # Step 7: Save the merged training dataset
+        self.client.datasets.save(self.train_dataset_name, merged_dataset, exist='version', skip_validation=True)
+        self.client.datasets.push(self.train_dataset_name, push_policy="version")
+
+        print(f"✓ TRAINING DATASET REBUILD COMPLETE:")
+        if not pseudo_only and initial_dataset is not None:
+            print(f"  - Initial GT: {len(initial_dataset)} images")
+        if has_manual:
+            print(f"  - Manual corrections: {len(manual_dataset)} images")
+        if has_pseudo:
+            print(f"  - Pseudo-labels: {len(pseudo_dataset)} images")
+        print(f"  - Total training dataset: {len(merged_dataset)} images")
+        print(f"  - Saved as: {self.train_dataset_name}")
+        print(f"  - Mode: {'PSEUDO-ONLY' if pseudo_only else 'STANDARD'}")
+        print(f"  - Label map: {label_map}")
+
+
+
+    def _merge_automated_pseudo_labels(self):
+        """For automated pseudo-labeling, just rebuild the training dataset."""
+        self._rebuild_training_dataset()
+
+
+    def _merge_corrected_labels(self):
+        """For manual corrections, the dataset was already updated, just rebuild training."""
+        self._rebuild_training_dataset()
+
+
 
     def _import_and_merge_annotations(self, export_path):
         """Common method to import annotations and merge with training dataset."""
@@ -1510,21 +1686,24 @@ class PseudoLabelingPipeline:
         print(f"  - Original initial dataset kept clean: {self.initial_annotated_dataset_name}")
         print("=" * 50)
 
+
     def train_model(self):
-        """Train model on current dataset with logging."""
+        """Train model on current dataset with logging. Supports widget configuration dictionary."""
         if self.train_cfg is None:
-            raise ValueError("Training configuration not set. Run setup_training_config() first.")
+            raise ValueError(
+                "Training configuration not set. Run setup_training_config() or set train_cfg dictionary first.")
 
         print("Starting model training...")
         self.db.update_status(self.flow_id, self.current_iteration, 'TRAINING')
-
-        model_type = self.train_cfg['model_type']
 
         # Use initial_annotated_dataset for first training, train_dataset_name for iterations
         if self.current_iteration == 0:
             dataset_to_use = self.initial_annotated_dataset_name
         else:
             dataset_to_use = self.train_dataset_name
+
+        # Use the widget/dictionary config method
+        model_type = self.train_cfg['model_type']
 
         # Base configuration parameters
         base_params = {
@@ -1534,16 +1713,29 @@ class PseudoLabelingPipeline:
             'batch_size': self.train_cfg['batch_size']
         }
 
+        # Add input_size if specified (for semantic segmentation)
+        if self.train_cfg.get('input_size'):
+            base_params['input_size'] = self.train_cfg['input_size']
+
         # Add backbone if selected
         if self.train_cfg.get('backbone') is not None:
-            base_params['backbone'] = self.train_cfg['backbone']
+            if model_type == "UPerNetConfig":
+                from onedl.zoo.semantic_segmentation import UPerNetBackbone
+                base_params['backbone'] = UPerNetBackbone(self.train_cfg['backbone'])
+            else:
+                base_params['backbone'] = self.train_cfg['backbone']
 
         # Create model configuration based on type
         try:
             if model_type == "FasterRCNNConfig":
+                from onedl.zoo.object_detection.mmdetection import FasterRCNNConfig
                 config = FasterRCNNConfig(**base_params)
             elif model_type == "MaskRCNNConfig":
+                from onedl.zoo.instance_segmentation.mmdetection import MaskRCNNConfig
                 config = MaskRCNNConfig(**base_params)
+            elif model_type == "UPerNetConfig":
+                from onedl.zoo.semantic_segmentation import UPerNetConfig
+                config = UPerNetConfig(**base_params)
             else:
                 raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -1563,20 +1755,31 @@ class PseudoLabelingPipeline:
                 'batch_size': self.train_cfg['batch_size']
             }
 
+            # Add input_size for fallback too
+            if self.train_cfg.get('input_size'):
+                basic_params['input_size'] = self.train_cfg['input_size']
+
             if model_type == "FasterRCNNConfig":
+                from onedl.zoo.object_detection.mmdetection import FasterRCNNConfig
                 config = FasterRCNNConfig(**basic_params)
-            else:
+            elif model_type == "MaskRCNNConfig":
+                from onedl.zoo.instance_segmentation.mmdetection import MaskRCNNConfig
                 config = MaskRCNNConfig(**basic_params)
+            elif model_type == "UPerNetConfig":
+                from onedl.zoo.semantic_segmentation import UPerNetConfig
+                config = UPerNetConfig(**basic_params)
 
             if hasattr(config, 'tracking'):
                 config.tracking.enabled = False
 
-        # Submit training job
         print(f"Training {model_type} on dataset: {dataset_to_use}")
         print(f"Configuration: {self.train_cfg['epochs']} epochs, batch size {self.train_cfg['batch_size']}")
         if self.train_cfg.get('backbone'):
             print(f"Backbone: {self.train_cfg['backbone']}")
+        if self.train_cfg.get('input_size'):
+            print(f"Input size: {self.train_cfg['input_size']}")
 
+        # Submit training job
         self.model_uid = self.client.jobs.submit(config)
         print(f"Training job submitted")
         print(f"Model UID: {self.model_uid}")
@@ -1692,6 +1895,44 @@ class PseudoLabelingPipeline:
         )
 
         print(f"Iteration 0 logged for {self.flow_id}")
+
+
+    def log_iteration_0_external_model(self, external_model_uid):
+        """Log iteration 0 using an external model."""
+        # Set the model UID
+        self.model_uid = external_model_uid
+        self.evaluation_uid = ""  # No evaluation for external model
+        self.evaluation_info_str = ""  # No evaluation info
+
+        print("=== LOGGING ITERATION 0 WITH EXTERNAL MODEL ===")
+        print(f"External model UID: {external_model_uid}")
+        print(f"Flow: {self.flow_id}")
+
+        # Use the database method
+        self.db.log_iteration_0_external_model(
+            flow_id=self.flow_id,
+            iteration=0,
+            num_gt_images=self.n_initial_samples,
+            num_gt_images_added=self.n_initial_samples,
+            num_pseudo_images=0,
+            num_pseudo_images_added=0,
+            total_train_size=self.n_initial_samples,
+            main_dataset=self.main_dataset_name,
+            validation_dataset=self.validation_dataset,
+            train_dataset=self.train_dataset_name,
+            pseudo_input_dataset_name="",
+            pseudo_output_dataset_name="",
+            inference_model_uid="",
+            model_uid=self.model_uid,
+            evaluation_uid=self.evaluation_uid,
+            evaluation_info=self.evaluation_info_str,
+            manual_correction=False,
+            cvat_project_id=self.cvat_project_id,
+            train_cfg=self.train_cfg
+        )
+
+        print(f"Iteration 0 logged with external model: {external_model_uid}")
+        print("Ready to proceed with pseudo-labeling iterations")
 
     def get_pipeline_status(self):
         """Display current pipeline status and state information."""
