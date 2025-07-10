@@ -1,28 +1,22 @@
-# --- Core ---
+# === CORE DEPENDENCIES ===
+# OneDL Platform
 onedl
-opencv-python
-scikit-image
-tqdm
-numpy
-pillow
+
+# HTTP requests for cvat
 requests
 
-# --- Interactive Menus ---
-inquirer
+# Jupyter widgets
 ipywidgets
 
-# --- Experiment Tracking / DB ---
-#sqlite3  # (Optional, usually built-in with Python >= 3.7)
-
-# --- Config Parsing ---
-pyyaml
-
-# --- Jupyter Environment ---
-#jupyter
+# Jupyter kernel support
 ipykernel
 
-# --- Optional for File Paths / Types ---
-#python-dotenv  # if you ever want to load secrets or paths from a `.env`
-
-# --- Segment Anything (optional, only if you're using SAM) ---
-segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
+# these should be built in (NO INSTALL NEEDED)
+# These built in if Python 3.7+
+# sqlite3 - Database operations for metadata tracking
+# json - JSON parsing for COCO annotations and configs
+# os - File system operations
+# glob - File pattern matching
+# time - Timestamps and delays
+# pathlib - Modern path handling
+# random - Sampling operations

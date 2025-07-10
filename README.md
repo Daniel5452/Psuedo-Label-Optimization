@@ -318,19 +318,99 @@ CREATE TABLE iteration_metadata (
 )
 ```
 
-### Status Tracking
+# Status Tracking
 
-Pipeline tracks detailed status for each iteration:
-- `INITIALIZED`: Iteration setup complete
-- `SAMPLING`: Selecting new data
-- `INFERENCE`: Generating predictions
-- `CVAT_PENDING`: Waiting for manual corrections
-- `MERGING`: Combining datasets
-- `TRAINING`: Model training in progress
-- `EVALUATING`: Model evaluation
-- `COMPLETED`: Iteration finished successfully
+## Pipeline Status Tracking
 
-### Database Operations
+The pipeline tracks detailed status updates throughout the lifecycle of each iteration. This includes sampling, inference, manual correction, training, evaluation, and completion.
+
+
+
+## All Possible Status States
+
+### Starting Iteration and Sampling Flow States
+
+| status              | description                                              |
+|---------------------|----------------------------------------------------------|
+| `INITIALIZED`       | iteration has been set up but no work started            |
+| `SAMPLING`          | currently sampling new images                            |
+| `SAMPLING_COMPLETE` | sampling finished successfully                           |
+| `PRE_INFERENCE`     | ready for inference (when using an existing dataset)     |
+
+### Inference States
+
+| status               | description                                |
+|----------------------|--------------------------------------------|
+| `INFERENCE`          | running inference on images                |
+| `INFERENCE_COMPLETE` | inference completed successfully           |
+
+### CVAT States
+
+| status         | description                                  |
+|----------------|----------------------------------------------|
+| `CVAT_EXPORT`  | exporting data to cvat for manual correction |
+| `CVAT_PENDING` | waiting for manual corrections in cvat       |
+| .....          | .......                                      |
+| `CVAT_FAILED`  | cvat export failed                           |
+
+### Merging States
+
+| status           | description                               |
+|------------------|-------------------------------------------|
+| `MERGING`        | currently merging pseudo-labels           |
+| `MERGE_COMPLETE` | merging completed successfully            |
+
+### Training States
+
+| status              | description                          |
+|---------------------|--------------------------------------|
+| `TRAINING`          | training job is running/waiting      |
+| `TRAINING_COMPLETE` | training completed successfully      |
+| `TRAINING_FAILED`   | training job failed                  |
+| `TRAINING_CANCELLED`| training job was cancelled           |
+
+### Evaluation States
+
+| status                 | description                          |
+|------------------------|--------------------------------------|
+| `EVALUATING`           | evaluation job is running/waiting    |
+| `EVALUATION_COMPLETE`  | evaluation completed successfully    |
+| `EVALUATION_FAILED`    | evaluation job failed                |
+| `EVALUATION_CANCELLED` | evaluation job was cancelled         |
+
+### Final State 
+
+| status      | description                |
+|-------------|----------------------------|
+| `COMPLETED` | entire iteration completed |
+
+---
+
+##  OneDL job states to database states
+
+### Training 
+
+| job state     | database status       |
+|---------------|------------------------|
+| `DONE`        | `TRAINING_COMPLETE`    |
+| `FAILED`      | `TRAINING_FAILED`      |
+| `CANCELLED`   | `TRAINING_CANCELLED`   |
+| `RUNNING`     | `TRAINING`             |
+| `WAITING`     | `TRAINING`             |
+| `UNALLOCABLE` | `TRAINING`             |
+
+### Evaluation 
+
+| job state     | database status         |
+|---------------|--------------------------|
+| `DONE`        | `EVALUATION_COMPLETE`    |
+| `FAILED`      | `EVALUATION_FAILED`      |
+| `CANCELLED`   | `EVALUATION_CANCELLED`   |
+| `RUNNING`     | `EVALUATING`             |
+| `WAITING`     | `EVALUATING`             |
+| `UNALLOCABLE` | `EVALUATING`             |
+
+## Database Operations
 
 #### View Pipeline Status
 ```python
@@ -456,7 +536,7 @@ train_cfg = {
     'backbone': MaskRCNNBackbone.REGNETX_4GF,
     'epochs': 75,
     'batch_size': 8
-    ('More advanced configs will be added soon...')
+    ('add as much as you want...')
 }
 pipeline.train_cfg = train_cfg
 ```
@@ -484,8 +564,8 @@ Please note that to run this loop, `manual_corrections` must be `False`
 ### 1. Data Quality
 - **Start Strong**: Ensure high-quality initial annotations
 - **Consistent Standards**: Maintain annotation consistency throughout
-- **Regular Review**: Periodically review pseudo-labels for quality
-- **Validation Monitoring**: Watch validation metrics for overfitting
+- **Regular Review**: Review pseudo-labels for quality
+- **Validation Monitoring**: Watch validation metrics 
 
 ### 2. Iteration Strategy
 - **Conservative Start**: Begin with higher confidence thresholds
@@ -494,14 +574,12 @@ Please note that to run this loop, `manual_corrections` must be `False`
 - **Regular Evaluation**: Monitor performance trends across iterations
 
 ### 3. Resource Management
-- **Storage Planning**: Monitor disk usage for exports and datasets
+- **Storage Planning**: Make sure you keep an eye on disk usage for exporting data
 - **Database Review**: Regularly review the database
-- **Documentation**: Track configuration decisions and results
 
 ### 4. Experimental Design
 - **Control Groups**: Compare different flows/strategies
 - **Baseline Comparison**: Compare against traditional annotation
-- **Statistical Significance**: Ensure meaningful improvement
 
 ## Changelog and Versioning
 
@@ -515,9 +593,8 @@ Please note that to run this loop, `manual_corrections` must be `False`
 - Data accumulation across iterations
 
 ### Planned Enhancements
-- Automatic CVAT Export
 - Specifying CVAT organization project and folder
-- Performance Analysis by implementing automatic visualizations using backend database 
+- Fixing CVAT Authentication
 
 ---
 
