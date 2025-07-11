@@ -1,0 +1,5 @@
+# Personal development files
+scrap/
+
+# Pipeline database files
+notebooks/*.db

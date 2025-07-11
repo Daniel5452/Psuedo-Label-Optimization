@@ -1,5 +1,0 @@
-# Instance Segmentation. Can be changed by user
-task_type: "inst_segmentation"
-model_class: MaskRCNNConfig     # matches the exact class name
-epochs: 50
-batch_size: 6
