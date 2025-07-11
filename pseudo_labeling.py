@@ -583,7 +583,7 @@ class PseudoLabelingPipeline:
             return True
 
         else:
-            print(f"ℹ️ No database record found - this appears to be a new iteration")
+            print(f"No database record found - this appears to be a new iteration")
             return False
 
     def _get_dataset_labels(self):
@@ -724,7 +724,7 @@ class PseudoLabelingPipeline:
         if self.flow_id is None:
             raise RuntimeError("Flow ID not set. Please provide current_flow parameter.")
 
-        # Check if current iteration is complete before proceeding (INCLUDING ITERATION 0)
+        # FIXED: Check if current iteration is complete before proceeding
         current_status = self.db.get_iteration_status(self.flow_id, self.current_iteration)
         if current_status == 'COMPLETED':
             self.current_iteration += 1
@@ -732,14 +732,14 @@ class PseudoLabelingPipeline:
                 f"Previous iteration {self.current_iteration - 1} completed. Moving to iteration {self.current_iteration}")
         elif current_status is None:
             print(f"No status found for iteration {self.current_iteration}. Proceeding...")
-        elif current_status != 'COMPLETED' and self.current_iteration > 0:
+        else:
+            # FIXED: Just show status and exit - the existing auto-recovery handles everything else
             print(f"Current iteration {self.current_iteration} status: {current_status}")
-            user_input = input("Do you want to restart this iteration? (y/n): ").lower().strip()
-            if user_input == 'y':
-                print(f"Restarting iteration {self.current_iteration}")
-            else:
-                print("Continuing with current iteration...")
+            print("Complete the current iteration first, or re-initialize the pipeline to auto-recover state.")
+            print("Use pipeline.get_pipeline_status() to see what step to do next.")
+            return
 
+        # [Rest of the original setup_next_iteration code remains exactly the same...]
         self.manual_corrections_global = manual_corrections
 
         # Get the last completed iteration for the specified flow
@@ -935,28 +935,16 @@ class PseudoLabelingPipeline:
 
     def sample_unseen_inputs(self):
         """
-        Sample new images and prepare them for either manual correction or pseudo-labeling.
-        Uses persistent dataset architecture.
+        Sample new images and prepare ALL pseudo data for re-inference.
+        FIXED: Save only inputs to avoid serialization issues.
         """
-        print(f"\n=== PERSISTENT ARCHITECTURE SAMPLING FOR ITERATION {self.current_iteration} ===")
+        print(f"\n=== SAMPLING FOR RE-INFERENCE (ITERATION {self.current_iteration}) ===")
 
-        # Check if sampling already completed for THIS specific iteration
+        # Check if sampling already completed
         current_status = self.db.get_iteration_status(self.flow_id, self.current_iteration)
         if current_status in ['SAMPLING_COMPLETE', 'INFERENCE', 'INFERENCE_COMPLETE', 'MERGING', 'MERGE_COMPLETE',
                               'TRAINING', 'TRAINING_COMPLETE', 'EVALUATING', 'EVALUATION_COMPLETE', 'COMPLETED']:
             print(f"✓ Sampling already completed for iteration {self.current_iteration}")
-            print(f"✓ Current status: {current_status}")
-
-            # Try to recover pseudo input dataset name for THIS iteration
-            self.db.cursor.execute(
-                'SELECT pseudo_input_dataset_name FROM iteration_metadata WHERE flow_id = ? AND iteration = ?',
-                (self.flow_id, self.current_iteration)
-            )
-            result = self.db.cursor.fetchone()
-            if result and result[0]:
-                self.pseudo_input_dataset_name = result[0]
-                print(f"✓ Recovered pseudo input dataset: {self.pseudo_input_dataset_name}")
-
             return
 
         self.db.update_status(self.flow_id, self.current_iteration, 'SAMPLING')
@@ -964,7 +952,7 @@ class PseudoLabelingPipeline:
         if self.current_iteration > 0 and (self.inference_model_uid is None or self.inference_model_uid == ""):
             raise ValueError(f"Inference model UID not set for iteration {self.current_iteration}.")
 
-        # Step 1: Load training dataset to see what's already used
+        # Load training dataset to see what's already used
         try:
             current_training = self.client.datasets.load(self.train_dataset_name, pull_policy="missing")
             training_hashes = set(current_training.inputs.hash_iterator())
@@ -973,7 +961,7 @@ class PseudoLabelingPipeline:
             print(f"✗ Could not load training dataset {self.train_dataset_name}: {e}")
             raise
 
-        # Step 2: Find images NOT in training dataset (disjoint set)
+        # Find unused images
         full_hashes = list(self.full_dataset.inputs.hash_iterator())
         unused_hashes = list(set(full_hashes) - training_hashes)
 
@@ -985,7 +973,7 @@ class PseudoLabelingPipeline:
             raise ValueError(
                 f"Only {len(unused_hashes)} unused images available, but {self.sample_size_per_iter} requested.")
 
-        # Step 3: Sample new images from unused set
+        # Sample new images
         sampled_hashes = random.sample(unused_hashes, self.sample_size_per_iter)
         index_map = {h: i for i, h in enumerate(full_hashes)}
         sampled_indices = [index_map[h] for h in sampled_hashes]
@@ -994,36 +982,55 @@ class PseudoLabelingPipeline:
         print(f"✓ Sampled {self.sample_size_per_iter} new images from unused set")
 
         if self.manual_corrections_global:
-            # Step 4a: For manual corrections - create temp dataset for CVAT export
+            # For manual corrections - create temp dataset (inputs only)
             temp_dataset = Dataset(inputs=new_sampled_data.inputs)
             self.client.datasets.save(self.pseudo_input_dataset_name, temp_dataset, exist="overwrite")
             self.client.datasets.push(self.pseudo_input_dataset_name, push_policy="version")
             print(f"✓ Created temp dataset for CVAT: {self.pseudo_input_dataset_name}")
-
         else:
-            # Step 4b: For pseudo-labeling - add to persistent pseudo dataset (inputs only)
+            # FIXED: For pseudo-labeling - combine all inputs and save as inputs-only dataset
+            persistent_pseudo_name = f"pseudo-f{self.current_flow}"
+
             try:
-                existing_pseudo = self.client.datasets.load(self.persistent_pseudo_dataset_name, pull_policy="missing")
-                print(f"✓ Found existing pseudo dataset with {len(existing_pseudo)} images")
-                updated_pseudo_dataset = existing_pseudo + Dataset(inputs=new_sampled_data.inputs)
+                # Load existing pseudo dataset and extract only inputs
+                existing_pseudo = self.client.datasets.load(persistent_pseudo_name, pull_policy="missing")
+                print(f"✓ Found existing pseudo dataset: {len(existing_pseudo)} images")
+
+                # FIXED: Combine datasets properly, then extract inputs
+                existing_dataset = Dataset(inputs=existing_pseudo.inputs)
+                new_dataset = Dataset(inputs=new_sampled_data.inputs)
+                combined_dataset = existing_dataset + new_dataset
+                all_inputs = combined_dataset.inputs
+
                 print(
-                    f"✓ Merged: {len(existing_pseudo)} existing + {len(new_sampled_data)} new = {len(updated_pseudo_dataset)} total")
+                    f"✓ Combined: {len(existing_pseudo)} existing + {len(new_sampled_data)} new = {len(all_inputs)} total")
+
             except Exception as e:
                 print(f"No existing pseudo dataset found: {e}")
-                updated_pseudo_dataset = Dataset(inputs=new_sampled_data.inputs)
-                print(f"✓ Created new persistent pseudo dataset with {len(updated_pseudo_dataset)} images")
+                # First iteration - only new data
+                all_inputs = new_sampled_data.inputs
+                print(f"✓ First iteration: {len(all_inputs)} new inputs")
 
-            # save pseudo dataset (inputs only)
-            self.client.datasets.save(self.persistent_pseudo_dataset_name, updated_pseudo_dataset, exist="version")
-            self.client.datasets.push(self.persistent_pseudo_dataset_name, push_policy="version")
-            print(f"✓ Updated persistent pseudo dataset: {self.persistent_pseudo_dataset_name}")
+            # FIXED: Create dataset with ONLY inputs (no targets, no predictions)
+            inputs_only_dataset = Dataset(inputs=all_inputs)
 
-        # Update database with sampling completion for THIS iteration
+            # Save as the persistent pseudo dataset
+            self.client.datasets.save(persistent_pseudo_name, inputs_only_dataset, exist="version")
+            self.client.datasets.push(persistent_pseudo_name, push_policy="version")
+
+            # Set this as our inference input
+            self.pseudo_input_dataset_name = persistent_pseudo_name
+
+            print(f"✓ Saved inputs-only dataset: {persistent_pseudo_name}")
+            print(f"✓ Ready for re-inference on {len(all_inputs)} images with evolved model")
+
+        # Update database
         self.db.update_iteration_field(
             self.flow_id, self.current_iteration,
             pseudo_input_dataset_name=self.pseudo_input_dataset_name,
             status='SAMPLING_COMPLETE'
         )
+
 
     def run_inference(self):
         """Run inference on the appropriate dataset based on mode."""
@@ -1094,7 +1101,7 @@ class PseudoLabelingPipeline:
         persistent_pseudo_name = f"pseudo-f{self.current_flow}"
 
         # CORRECTED: Replace the entire dataset instead of adding to it
-        self.client.datasets.save(persistent_pseudo_name, predicted_dataset, exist="overwrite")
+        self.client.datasets.save(persistent_pseudo_name, predicted_dataset, exist="version")
         self.client.datasets.push(persistent_pseudo_name, push_policy="version")
 
         print(f"✓ Replaced persistent pseudo dataset: {persistent_pseudo_name}")
@@ -1648,7 +1655,17 @@ class PseudoLabelingPipeline:
                 print(f"Report URL: {report_url}")
                 print(f"Metrics: {self.evaluation_info_str}")
 
-                db_status = 'EVALUATION_COMPLETE'
+                # FIXED: Automatically complete the iteration when evaluation is done
+                self.db.update_iteration_field(
+                    self.flow_id, self.current_iteration,
+                    evaluation_uid=self.evaluation_uid,
+                    evaluation_info=self.evaluation_info_str,
+                    status='COMPLETED'
+                )
+                self.db.complete_iteration(self.flow_id, self.current_iteration)
+                print("✓ Iteration automatically marked as COMPLETED")
+                return
+
             except Exception as e:
                 print(f"Error retrieving evaluation results: {e}")
                 self.evaluation_info_str = ""
@@ -1667,12 +1684,13 @@ class PseudoLabelingPipeline:
             self.evaluation_info_str = ""
             db_status = 'EVALUATING'  # Default fallback
 
-        # Update database with evaluation results
+        # Update database with evaluation results (for non-DONE cases)
         self.db.update_iteration_field(
             self.flow_id, self.current_iteration,
             evaluation_uid=self.evaluation_uid,
             evaluation_info=self.evaluation_info_str,
-            status=db_status)
+            status=db_status
+        )
 
     def complete_iteration(self):
         """
