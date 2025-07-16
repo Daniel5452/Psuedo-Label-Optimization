@@ -227,56 +227,190 @@ class DatabaseManager:
         ))
         self.conn.commit()
 
+
 class CVATManager:
-    """Handles CVAT API operations and annotation management."""
+    """Handles CVAT API operations and annotation management with organization support."""
 
     def __init__(self, cvat_url="https://cvat2.vbti.nl"):
         self.cvat_url = cvat_url
         self.cvat_api_url = f"{cvat_url}/api"
         self.session = None
+        self.current_organization = None
 
-    def authenticate(self, username, password):
-        """Authenticate with CVAT server."""
+    def authenticate(self, username, password, organization=None):
+        """Authenticate with CVAT server and optionally set organization context."""
         self.session = requests.Session()
         resp = self.session.post(f"{self.cvat_api_url}/auth/login",
                                  json={"username": username, "password": password})
         if resp.status_code == 200:
             token = resp.json()["key"]
             self.session.headers.update({"Authorization": f"Token {token}"})
-            print("CVAT authentication successful.")
+
+            # Set organization context if provided
+            if organization:
+                self.set_organization(organization)
+
+            print("✓ CVAT authentication successful.")
             return True
         else:
             raise RuntimeError("CVAT authentication failed. Check credentials.")
 
-    def get_or_create_project(self, project_name, dataset_labels):
-        """Get existing project or create new one with labels from dataset."""
-        # First, try to find existing project
-        resp = self.session.get(f"{self.cvat_api_url}/projects")
+
+    def get_organizations(self):
+        """Get list of organizations user has access to."""
+        if not self.session:
+            raise RuntimeError("Not authenticated. Call authenticate() first.")
+
+        resp = self.session.get(f"{self.cvat_api_url}/organizations")
         if resp.status_code == 200:
-            projects = resp.json()["results"]
-            for project in projects:
-                if project["name"] == project_name:
-                    print(f"Using existing CVAT project: {project_name} (ID: {project['id']})")
-                    return project["id"]
+            return resp.json()["results"]
+        return []
 
-        # Create new project if not found - with dynamic labels from dataset
+
+    def set_organization(self, org_name):
+        """Set organization context for subsequent API calls."""
+        orgs = self.get_organizations()
+        org = next((o for o in orgs if o["slug"] == org_name or o["name"] == org_name), None)
+        if org:
+            self.current_organization = org["id"]
+            print(f"Organization set: {org['name']} (ID: {org['id']}, slug: {org['slug']})")
+
+            # Validate access
+            if self.validate_organization_access():
+                print("Organization access confirmed")
+            else:
+                print("Warning: Organization access validation failed")
+
+            return True
+        else:
+            available = [f"{o['name']} (ID: {o['id']}, slug: {o['slug']})" for o in orgs]
+            print(f"✗ Organization '{org_name}' not found")
+            print(f"Available organizations: {available}")
+            return False
+
+    def validate_organization_access(self):
+        """Validate organization access using only working methods and cache the best one."""
+        if not self.current_organization:
+            print("✓ Using personal workspace (no organization)")
+            return True
+
+        # Check if organization exists and is accessible
+        resp = self.session.get(f"{self.cvat_api_url}/organizations/{self.current_organization}")
+        if resp.status_code != 200:
+            print(f"✗ Organization ID {self.current_organization} not accessible: {resp.status_code}")
+            return False
+
+        org_data = resp.json()
+        org_slug = org_data.get('slug')
+        print(f"✓ Organization validated: {org_data['name']} (ID: {self.current_organization})")
+
+        # Test only working methods in priority order
+        working_methods = [
+            {"params": {"org": org_slug}, "name": "org_slug", "type": "param"},
+            {"params": {"org_id": self.current_organization}, "name": "org_id", "type": "param"},
+            {"headers": {"X-Organization": org_slug}, "name": "x_org_slug", "type": "header"},
+        ]
+
+        for method in working_methods:
+            if not org_slug and "org_slug" in method["name"]:
+                continue  # Skip slug methods if no slug available
+
+            test_resp = self.session.get(
+                f"{self.cvat_api_url}/projects",
+                params=method.get("params", {}),
+                headers=method.get("headers", {}),
+                timeout=10
+            )
+
+            if test_resp.status_code == 200:
+                # Cache the working method for later use
+                self.preferred_method = method
+                print("✓ Organization access confirmed")
+                return True
+
+        print("✗ No working organization access method found")
+        return False
+
+    def get_or_create_project(self, project_name, dataset_labels, project_id=None):
+        """Optimized project handling using cached working methods."""
+        # Option 1: Use specific project ID if provided
+        if project_id:
+            resp = self.session.get(f"{self.cvat_api_url}/projects/{project_id}")
+            if resp.status_code == 200:
+                project_data = resp.json()
+                print(f"Using existing CVAT project: {project_data['name']} (ID: {project_id})")
+                return project_id
+            else:
+                print(f"Warning: Project ID {project_id} not found or not accessible")
+
+        # Option 2: Search by name using preferred method if available
+        if hasattr(self, 'preferred_method') and self.current_organization:
+            method = self.preferred_method
+            print(f"Searching for project using cached method: {method['name']}")
+
+            resp = self.session.get(
+                f"{self.cvat_api_url}/projects",
+                params=method.get("params", {}),
+                headers=method.get("headers", {}),
+                timeout=10
+            )
+
+            if resp.status_code == 200:
+                projects = resp.json()["results"]
+                for project in projects:
+                    if project["name"] == project_name:
+                        print(f"✓ Found existing project: {project_name} (ID: {project['id']})")
+                        return project["id"]
+                print(f"Project '{project_name}' not found, will create new one")
+            else:
+                print(f"Project search failed: {resp.status_code}")
+
+        # Fallback: search without organization context
+        if not hasattr(self, 'preferred_method') or not self.current_organization:
+            resp = self.session.get(f"{self.cvat_api_url}/projects")
+            if resp.status_code == 200:
+                projects = resp.json()["results"]
+                for project in projects:
+                    if project["name"] == project_name:
+                        print(f"Found existing project in personal space: {project_name} (ID: {project['id']})")
+                        return project["id"]
+
+        # Option 3: Create new project using preferred method
         labels = [{"name": label, "attributes": []} for label in dataset_labels]
+        payload = {"name": project_name, "labels": labels}
 
-        payload = {
-            "name": project_name,
-            "labels": labels
-        }
+        if hasattr(self, 'preferred_method') and self.current_organization:
+            method = self.preferred_method
+            print(f"Creating project using cached method: {method['name']}")
+
+            resp = self.session.post(
+                f"{self.cvat_api_url}/projects",
+                json=payload,
+                params=method.get("params", {}),
+                headers=method.get("headers", {}),
+                timeout=30
+            )
+
+            if resp.status_code == 201:
+                pid = resp.json()["id"]
+                print(f"✓ Created project in organization: {project_name} (ID: {pid})")
+                return pid
+            else:
+                print(f"Organization project creation failed: {resp.status_code}")
+
+        # Fallback: create in personal space
+        print("Creating project in personal workspace...")
         resp = self.session.post(f"{self.cvat_api_url}/projects", json=payload)
+
         if resp.status_code == 201:
             pid = resp.json()["id"]
-            print(f"Created new CVAT project: {project_name} (ID: {pid})")
-            print(f"Project created with labels: {', '.join(dataset_labels)}")
+            print(f"Created project in personal workspace: {project_name} (ID: {pid})")
             return pid
         else:
-            raise RuntimeError(f"CVAT project creation failed: {resp.text}")
+            raise RuntimeError(f"CVAT project creation failed: {resp.status_code} - {resp.text}")
 
     def create_task(self, project_id, task_name):
-        """Create a new CVAT task."""
+        """Create a new CVAT task using cached organization method."""
         payload = {
             "name": task_name,
             "project_id": project_id,
@@ -285,10 +419,24 @@ class CVATManager:
             "segment_size": 0,
             "dimension": "2d"
         }
-        resp = self.session.post(f"{self.cvat_api_url}/tasks", json=payload)
+
+        # Use cached method if available (same as project creation)
+        if hasattr(self, 'preferred_method') and self.current_organization:
+            method = self.preferred_method
+            resp = self.session.post(
+                f"{self.cvat_api_url}/tasks",
+                json=payload,
+                params=method.get("params", {}),
+                headers=method.get("headers", {}),
+                timeout=30
+            )
+        else:
+            # Fallback for personal workspace
+            resp = self.session.post(f"{self.cvat_api_url}/tasks", json=payload)
+
         if resp.status_code == 201:
             tid = resp.json()["id"]
-            print(f"CVAT task created: {task_name} (ID: {tid})")
+            print(f"✓ Task created: {task_name} (ID: {tid})")
             return tid
         else:
             raise RuntimeError(f"CVAT task creation failed: {resp.text}")
@@ -308,7 +456,21 @@ class CVATManager:
         }
 
         payload = {"image_quality": 70, "sorting_method": "lexicographical"}
-        resp = self.session.post(url, files=files, data=payload)
+
+        # Use cached method if available (same as task creation)
+        if hasattr(self, 'preferred_method') and self.current_organization:
+            method = self.preferred_method
+            resp = self.session.post(
+                url,
+                files=files,
+                data=payload,
+                params=method.get("params", {}),
+                headers=method.get("headers", {}),
+                timeout=120
+            )
+        else:
+            # Fallback for personal workspace
+            resp = self.session.post(url, files=files, data=payload)
 
         # Close file handles
         for f in files.values():
@@ -323,6 +485,7 @@ class CVATManager:
         # Wait for image upload to complete
         self._wait_for_data_upload(task_id, rq_id)
         print("Images uploaded and processed successfully.")
+
 
     def _wait_for_data_upload(self, task_id, rq_id):
         """Wait for data upload to complete by checking task status."""
@@ -362,53 +525,85 @@ class CVATManager:
             raise RuntimeError("Timeout waiting for image upload. Check CVAT manually.")
 
     def upload_annotations(self, task_id, annotation_file):
-        """Upload COCO annotations to CVAT task."""
+        """Upload COCO annotations to CVAT task using proper file upload format."""
         format_name = "COCO 1.0"
-        url = f"{self.cvat_api_url}/tasks/{task_id}/annotations?format={format_name}&location=local"
 
-        with open(annotation_file, "rb") as f:
-            files = {"annotation_file": (os.path.basename(annotation_file), f)}
-            print(f"Uploading annotations to CVAT task {task_id}...")
-            resp = self.session.post(url, files=files)
+        print(f"Uploading annotations to CVAT...")
 
-            if resp.status_code == 202:
-                rq_id = resp.json().get("rq_id")
-                print("CVAT annotation upload started. Request ID:", rq_id)
-                self._check_annotation_status(rq_id)
-            else:
-                print(f"CVAT annotation upload failed: {resp.status_code} - {resp.text}")
-                print("Task created successfully, but you'll need to manually upload annotations in CVAT.")
+        try:
+            with open(annotation_file, "rb") as f:
+                # Prepare the multipart form data
+                files = {"annotation_file": ("instances_default.json", f, "application/json")}
+                data = {
+                    "format": format_name,
+                    "location": "local"
+                }
+
+                # Use cached method if available (same as other operations)
+                if hasattr(self, 'preferred_method') and self.current_organization:
+                    method = self.preferred_method
+                    # Add organization params to data instead of separate params
+                    if method.get("params"):
+                        data.update(method["params"])
+
+                    headers = method.get("headers", {})
+                    resp = self.session.post(
+                        f"{self.cvat_api_url}/tasks/{task_id}/annotations",
+                        files=files,
+                        data=data,
+                        headers=headers,
+                        timeout=60
+                    )
+                else:
+                    # Fallback for personal workspace
+                    resp = self.session.post(
+                        f"{self.cvat_api_url}/tasks/{task_id}/annotations",
+                        files=files,
+                        data=data,
+                        timeout=60
+                    )
+
+                if resp.status_code == 202:
+                    rq_id = resp.json().get("rq_id")
+                    print(f"✓ Annotation upload started (Request ID: {rq_id})")
+                    self._check_annotation_status(rq_id)
+                else:
+                    print(f"Annotation upload failed: {resp.status_code} - {resp.text}")
+
+        except Exception as e:
+            print(f"Exception during annotation upload: {e}")
+            print("Please manually upload annotations in CVAT.")
 
     def _check_annotation_status(self, rq_id):
-        """Check CVAT annotation upload status."""
+        """Check CVAT annotation upload status with cleaner output."""
         url = f"{self.cvat_api_url}/requests/{rq_id}"
-        print("Waiting for CVAT annotation import to complete...")
         max_attempts = 24  # 2 minutes max wait
         attempt = 0
 
         while attempt < max_attempts:
             resp = self.session.get(url)
             if resp.status_code != 200:
-                print("Failed to check CVAT status:", resp.text)
+                print(f"✗ Failed to check status: {resp.status_code}")
                 break
 
             status_data = resp.json()
             state = status_data.get("state")
 
             if state == "finished":
-                print("CVAT annotation import completed successfully.")
+                print("✓ Annotation upload completed successfully")
                 break
             elif state == "failed":
                 error_msg = status_data.get("message", "Unknown error")
-                print(f"CVAT annotation import failed: {error_msg}")
-                raise RuntimeError(f"CVAT annotation import failed: {error_msg}")
+                print(f"✗ Annotation upload failed: {error_msg}")
+                break
             else:
-                print(f"Still processing... State: {state}")
+                if attempt % 4 == 0:  # Only print every 4th attempt to reduce spam
+                    print(f"Processing annotations... ({attempt + 1}/{max_attempts})")
                 time.sleep(5)
                 attempt += 1
 
         if attempt >= max_attempts:
-            print("Timeout waiting for annotation import. Check CVAT manually.")
+            print("⚠ Timeout waiting for annotation upload. Check CVAT manually.")
 
 
 class PseudoLabelingPipeline:
@@ -443,7 +638,6 @@ class PseudoLabelingPipeline:
         self.sample_size_per_iter = sample_size_per_iter
         self.min_confidence = min_confidence
         self.local_path = local_path
-        self.cvat_project_id = cvat_project_id
 
         # Initialize helper classes
         self.db = DatabaseManager(db_path)
@@ -544,6 +738,54 @@ class PseudoLabelingPipeline:
 
         print("=" * 60)
 
+    def cvat_connect(self, username, password, organization=None, project_id=None, project_name=None):
+        """
+        CVAT connection and configure project settings.
+
+        Args:
+            username (str): CVAT username
+            password (str): CVAT password
+            organization (str, optional): Organization name or slug to work within
+            project_id (int, optional): Use existing project ID (leave None to create/find by name)
+            project_name (str, optional): Project name to find/create (leave None to use default naming)
+
+        Returns:
+            bool: True if connection successful, False otherwise
+        """
+        try:
+            success = self.cvat.authenticate(username, password, organization)
+            if success:
+                self.cvat_authenticated = True
+
+                # Store project configuration for later use
+                self.cvat_project_config = {
+                    'project_id': project_id,
+                    'project_name': project_name
+                }
+
+                if organization:
+                    print(f"✓ CVAT session established in organization: {organization}")
+                else:
+                    print("✓ CVAT session established in personal workspace")
+
+                # Show project configuration
+                if project_id:
+                    print(f"✓ Will use existing project ID: {project_id}")
+                elif project_name:
+                    print(f"✓ Will find/create project: {project_name}")
+                else:
+                    default_name = f"{self.flow_id}-project"
+                    print(f"✓ Will use default project naming: {default_name}")
+
+            return success
+
+        except Exception as e:
+            print(f"✗ CVAT connection failed: {e}")
+            self.cvat_authenticated = False
+            return False
+
+
+
     def recover_current_iteration_state(self):
         """
         Recover current iteration state from database after kernel restart.
@@ -552,7 +794,8 @@ class PseudoLabelingPipeline:
         print(f"Recovering state for {self.flow_id} iteration {self.current_iteration}...")
 
         self.db.cursor.execute('''
-            SELECT model_uid, evaluation_uid, pseudo_output_dataset_name, manual_correction
+            SELECT model_uid, evaluation_uid, pseudo_output_dataset_name, 
+                   manual_correction, inference_model_uid, pseudo_input_dataset_name
             FROM iteration_metadata 
             WHERE flow_id = ? AND iteration = ?
         ''', (self.flow_id, self.current_iteration))
@@ -560,7 +803,8 @@ class PseudoLabelingPipeline:
         result = self.db.cursor.fetchone()
 
         if result:
-            model_uid, eval_uid, pseudo_output, manual_corr = result
+            (model_uid, eval_uid, pseudo_output, manual_corr,
+             inference_model_uid, pseudo_input) = result
 
             # Recover essential state
             if model_uid:
@@ -578,6 +822,24 @@ class PseudoLabelingPipeline:
             if manual_corr is not None:
                 self.manual_corrections_global = bool(manual_corr)
                 print(f"✓ Recovered manual_corrections_mode: {self.manual_corrections_global}")
+
+            if inference_model_uid:
+                self.inference_model_uid = inference_model_uid
+                print(f"✓ Recovered inference_model_uid: {inference_model_uid}")
+
+            # NEW: Recover pseudo_input_dataset_name
+            if pseudo_input:
+                self.pseudo_input_dataset_name = pseudo_input
+                print(f"✓ Recovered pseudo_input_dataset_name: {pseudo_input}")
+
+                # For manual corrections, also set the persistent pseudo dataset name
+                if self.manual_corrections_global:
+                    # In manual mode, pseudo_input is the temp dataset
+                    print(f"✓ Manual corrections mode - using temp dataset: {pseudo_input}")
+                else:
+                    # In auto mode, pseudo_input is the persistent dataset
+                    self.persistent_pseudo_dataset_name = pseudo_input
+                    print(f"✓ Auto mode - set persistent pseudo dataset: {pseudo_input}")
 
             print("✓ Recovery complete - ready to resume")
             return True
@@ -936,15 +1198,16 @@ class PseudoLabelingPipeline:
     def sample_unseen_inputs(self):
         """
         Sample new images and prepare ALL pseudo data for re-inference.
-        FIXED: Save only inputs to avoid serialization issues.
         """
         print(f"\n=== SAMPLING FOR RE-INFERENCE (ITERATION {self.current_iteration}) ===")
 
-        # Check if sampling already completed
+        # Check if sampling already completed - FIXED: Added missing CVAT statuses
         current_status = self.db.get_iteration_status(self.flow_id, self.current_iteration)
-        if current_status in ['SAMPLING_COMPLETE', 'INFERENCE', 'INFERENCE_COMPLETE', 'MERGING', 'MERGE_COMPLETE',
-                              'TRAINING', 'TRAINING_COMPLETE', 'EVALUATING', 'EVALUATION_COMPLETE', 'COMPLETED']:
-            print(f"✓ Sampling already completed for iteration {self.current_iteration}")
+        if current_status in ['SAMPLING_COMPLETE', 'INFERENCE', 'INFERENCE_COMPLETE', 'CVAT_EXPORT', 'CVAT_PENDING',
+                              'CVAT_FAILED',
+                              'MERGING', 'MERGE_COMPLETE', 'TRAINING', 'TRAINING_COMPLETE', 'EVALUATING',
+                              'EVALUATION_COMPLETE', 'COMPLETED']:
+            print(f"✓ Sampling already completed for iteration {self.current_iteration} (status: {current_status})")
             return
 
         self.db.update_status(self.flow_id, self.current_iteration, 'SAMPLING')
@@ -1031,23 +1294,90 @@ class PseudoLabelingPipeline:
             status='SAMPLING_COMPLETE'
         )
 
-
     def run_inference(self):
         """Run inference on the appropriate dataset based on mode."""
         if self.inference_model_uid is None:
             raise ValueError("Inference model UID not set. Use set_inference_model_uid() first.")
 
+        # Check if inference already completed
+        current_status = self.db.get_iteration_status(self.flow_id, self.current_iteration)
+        if current_status in ['INFERENCE_COMPLETE', 'CVAT_EXPORT', 'CVAT_PENDING', 'CVAT_FAILED',
+                              'MERGING', 'MERGE_COMPLETE', 'TRAINING', 'TRAINING_COMPLETE',
+                              'EVALUATING', 'EVALUATION_COMPLETE', 'COMPLETED']:
+            print(f"✓ Inference already completed for iteration {self.current_iteration} (status: {current_status})")
+            return
+
         print(f"Running inference with model: {self.inference_model_uid}")
         self.db.update_status(self.flow_id, self.current_iteration, 'INFERENCE')
 
-        # Use persistent pseudo dataset for inference (only for non-manual mode)
-        if not self.manual_corrections_global:
-            pseudo_inference_dataset = self.persistent_pseudo_dataset_name
-            print(f"Running inference on persistent pseudo dataset: {pseudo_inference_dataset}")
+        if self.manual_corrections_global:
+            # Manual corrections mode - run inference on temp dataset AND update existing pseudo dataset
+            temp_dataset = self.pseudo_input_dataset_name  # temp-cvat-iter{N}-{flow_id}
+            print(f"Running inference on temp dataset for manual corrections: {temp_dataset}")
 
+            # Run inference on temp dataset for CVAT
             config = EvaluationConfig(
                 model_name=self.inference_model_uid,
-                dataset_name=pseudo_inference_dataset,
+                dataset_name=temp_dataset,
+                report_template=REPORT_TEMPLATE.EMPTY,
+                batch_size=1
+            )
+            job = self.client.jobs.submit(config)
+            self.predicted_dataset_name = self.client.jobs.get_dataset(job)
+            print(f"✓ Temp dataset predictions saved as: {self.predicted_dataset_name}")
+
+            # ALSO run inference on existing pseudo dataset to update old labels
+            persistent_pseudo_name = f"pseudo-f{self.current_flow}"
+            try:
+                existing_pseudo = self.client.datasets.load(persistent_pseudo_name, pull_policy="missing")
+                print(f"✓ Found existing pseudo dataset with {len(existing_pseudo)} images")
+                print(f"✓ Re-running inference on existing pseudo dataset with evolved model...")
+
+                config_pseudo = EvaluationConfig(
+                    model_name=self.inference_model_uid,
+                    dataset_name=persistent_pseudo_name,
+                    report_template=REPORT_TEMPLATE.EMPTY,
+                    batch_size=1
+                )
+                job_pseudo = self.client.jobs.submit(config_pseudo)
+                updated_pseudo_predictions = self.client.jobs.get_dataset(job_pseudo)
+
+                # Replace the persistent pseudo dataset with updated predictions
+                predicted_pseudo_dataset = self.client.datasets.load(updated_pseudo_predictions)
+
+                # Filter predictions by confidence and set as targets
+                filtered_predictions = []
+                for pred in predicted_pseudo_dataset.predictions:
+                    if hasattr(pred, 'filter_by_confidence'):
+                        filtered_pred = pred.filter_by_confidence(self.min_confidence)
+                        filtered_predictions.append(filtered_pred)
+                    else:
+                        filtered_predictions.append(pred)
+
+                predicted_pseudo_dataset.predictions = filtered_predictions
+                predicted_pseudo_dataset.targets = predicted_pseudo_dataset.predictions
+
+                # Replace the persistent pseudo dataset
+                self.client.datasets.save(persistent_pseudo_name, predicted_pseudo_dataset, exist="version")
+                self.client.datasets.push(persistent_pseudo_name, push_policy="version")
+
+                print(f"✓ Updated persistent pseudo dataset: {persistent_pseudo_name}")
+                print(
+                    f"✓ Dataset now contains {len(predicted_pseudo_dataset)} images with updated predictions as targets")
+
+            except Exception as e:
+                print(f"No existing pseudo dataset found: {e}")
+                print("✓ No existing pseudo labels to update")
+
+        else:
+            # Auto pseudo-labeling mode - run inference on persistent pseudo dataset
+            inference_dataset = self.persistent_pseudo_dataset_name  # pseudo-{flow_id}
+            print(f"Running inference on persistent pseudo dataset: {inference_dataset}")
+
+            # Run inference on the appropriate dataset
+            config = EvaluationConfig(
+                model_name=self.inference_model_uid,
+                dataset_name=inference_dataset,
                 report_template=REPORT_TEMPLATE.EMPTY,
                 batch_size=1
             )
@@ -1058,17 +1388,18 @@ class PseudoLabelingPipeline:
             print(f"Inference complete")
             print(f"Predictions saved as: {self.predicted_dataset_name}")
 
-            # NEW: Replace the persistent pseudo dataset with filtered predictions
+            # Auto mode: Replace the persistent pseudo dataset with filtered predictions
             self._replace_persistent_pseudo_dataset_with_predictions()
+            print("✓ Persistent pseudo dataset updated with new predictions")
 
-            # Update database
-            self.db.update_iteration_field(
-                self.flow_id, self.current_iteration,
-                pseudo_output_dataset_name=self.predicted_dataset_name,
-                status='INFERENCE_COMPLETE'
-            )
-        else:
-            print("Manual corrections mode - skipping inference step")
+        # Update database
+        self.db.update_iteration_field(
+            self.flow_id, self.current_iteration,
+            pseudo_output_dataset_name=self.predicted_dataset_name,
+            status='INFERENCE_COMPLETE'
+        )
+
+
 
     def _replace_persistent_pseudo_dataset_with_predictions(self):
         """
@@ -1122,43 +1453,43 @@ class PseudoLabelingPipeline:
         )
 
     def manually_correct_cvat(self):
-        """Export predictions to CVAT for manual correction with logging."""
+        """Export predictions to CVAT for manual correction."""
         if not self.manual_corrections_global:
             print("Manual corrections not enabled for this iteration.")
             return
 
-        print("Starting CVAT export process...")
+        # Check if CVAT export already completed or in progress
+        current_status = self.db.get_iteration_status(self.flow_id, self.current_iteration)
+        if current_status in ['MERGING', 'MERGE_COMPLETE', 'TRAINING', 'TRAINING_COMPLETE',
+                              'EVALUATING', 'EVALUATION_COMPLETE', 'COMPLETED']:
+            print(f"✓ CVAT export already completed (status: {current_status})")
+            return
+
+        if not hasattr(self, 'cvat_authenticated') or not self.cvat_authenticated:
+            raise RuntimeError("CVAT not connected. Please run pipeline.cvat_connect() first.")
+
+        print("Exporting to CVAT...")
         self.db.update_status(self.flow_id, self.current_iteration, 'CVAT_EXPORT')
 
-        # Get user input
-        username = input("CVAT Username: ")
-        password = input("CVAT Password: ")
-        project_name = input(f"CVAT Project Name (default: {self.flow_id}-project): ") or f"{self.flow_id}-project"
-
-        # Export and upload to CVAT
         try:
-            self._export_to_cvat(username, password, project_name)
-            print("\nCVAT export completed successfully!")
-            print("Please complete your annotations in CVAT.")
-            print("The next cell will handle importing the corrected annotations and merging.")
-
-            # Update status to indicate CVAT work is needed
+            self._export_to_cvat()
+            print("✓ CVAT export completed successfully!")
+            print("Complete your annotations in CVAT, then run merge with manual_annotation_path.")
             self.db.update_status(self.flow_id, self.current_iteration, 'CVAT_PENDING')
 
         except Exception as e:
-            print(f"CVAT export failed: {e}")
+            print(f"✗ CVAT export failed: {e}")
             self.db.update_status(self.flow_id, self.current_iteration, 'CVAT_FAILED')
+            raise
 
-    def _export_to_cvat(self, username, password, project_name):
-        """Internal method to handle CVAT export with full JSON preprocessing."""
+    def _export_to_cvat(self):
+        """Internal method to handle CVAT export with minimal output."""
         # Set up paths
         export_path = Path(self.local_path) / f"cvat_export_iter_{self.current_iteration}"
 
-        # Delete existing folder if it exists to avoid conflicts
         if export_path.exists():
             import shutil
             shutil.rmtree(export_path)
-            print(f"Deleted existing export folder: {export_path}")
 
         export_path.mkdir(parents=True, exist_ok=True)
 
@@ -1166,8 +1497,6 @@ class PseudoLabelingPipeline:
         json_filename = "annotations/instances_default.json"
         annotations_dir = export_path / "annotations"
         annotations_dir.mkdir(exist_ok=True)
-
-        print(f"Preparing export to: {export_path}")
 
         # Load and export dataset
         raw_ds = self.client.datasets.load(self.predicted_dataset_name)
@@ -1178,135 +1507,120 @@ class PseudoLabelingPipeline:
         raw_ds.targets = raw_ds.predictions
         raw_ds.export_coco(path=export_path, json_filename=json_filename)
 
-        print(f"Initial COCO export complete (confidence >= {self.min_confidence})")
+        print(f"✓ Exported {len(raw_ds)} images with {sum(len(pred) for pred in raw_ds.predictions)} annotations")
 
         # ========== JSON PREPROCESSING FOR CVAT COMPATIBILITY ==========
         json_path = export_path / json_filename
         with open(json_path, "r") as f:
             coco_data = json.load(f)
 
-        print(
-            f"Before fixes - Categories: {len(coco_data.get('categories', []))}, Images: {len(coco_data.get('images', []))}, Annotations: {len(coco_data.get('annotations', []))}")
-
-        # Fix 1: Clean image file names
+        # Fix image file names
         for image_entry in coco_data.get("images", []):
             image_entry["file_name"] = Path(image_entry["file_name"]).name
 
-        # Fix 2: Remove problematic fields from annotations
+        # Remove problematic fields from annotations
         for annotation in coco_data.get("annotations", []):
-            # Remove score field - this causes import errors in CVAT
             if "score" in annotation:
                 del annotation["score"]
-
-            # Ensure required fields are present
             if "iscrowd" not in annotation:
                 annotation["iscrowd"] = 0
-
-            # Ensure area is calculated if missing
             if "area" not in annotation and "bbox" in annotation:
                 bbox = annotation["bbox"]
-                annotation["area"] = bbox[2] * bbox[3]  # width * height
+                annotation["area"] = bbox[2] * bbox[3]
 
-        # Fix 3: Check category ID starting point and shift if needed
+        # Fix category ID starting point
         categories = coco_data.get("categories", [])
-        if categories:
-            min_category_id = min(cat["id"] for cat in categories)
-            if min_category_id == 0:
-                print("Shifting category IDs from 0-based to 1-based...")
-                for category in categories:
-                    category["id"] += 1
-                for annotation in coco_data.get("annotations", []):
-                    annotation["category_id"] += 1
-                print("Category IDs shifted by +1 for CVAT compatibility.")
-            else:
-                print(f"Category IDs already start from {min_category_id}, no shift needed.")
+        if categories and min(cat["id"] for cat in categories) == 0:
+            for category in categories:
+                category["id"] += 1
+            for annotation in coco_data.get("annotations", []):
+                annotation["category_id"] += 1
 
-        # Fix 4: Validate image IDs (CVAT might need 1-based image IDs too)
+        # Fix image IDs
         images = coco_data.get("images", [])
-        if images:
-            min_image_id = min(img["id"] for img in images)
-            if min_image_id == 0:
-                print("Converting image IDs from 0-based to 1-based...")
-                # Create mapping for image ID conversion
-                image_id_mapping = {}
-                for i, image in enumerate(images):
-                    old_id = image["id"]
-                    new_id = i + 1  # Start from 1
-                    image["id"] = new_id
-                    image_id_mapping[old_id] = new_id
+        if images and min(img["id"] for img in images) == 0:
+            image_id_mapping = {}
+            for i, image in enumerate(images):
+                old_id = image["id"]
+                new_id = i + 1
+                image["id"] = new_id
+                image_id_mapping[old_id] = new_id
 
-                # Update annotation image_id references
-                for annotation in coco_data.get("annotations", []):
-                    old_image_id = annotation["image_id"]
-                    if old_image_id in image_id_mapping:
-                        annotation["image_id"] = image_id_mapping[old_image_id]
-                    else:
-                        print(f"Warning: Annotation references non-existent image_id {old_image_id}")
+            for annotation in coco_data.get("annotations", []):
+                old_image_id = annotation["image_id"]
+                if old_image_id in image_id_mapping:
+                    annotation["image_id"] = image_id_mapping[old_image_id]
 
-                print("Image IDs converted to 1-based indexing.")
-            else:
-                print(f"Image IDs already start from {min_image_id}, no conversion needed.")
-
-        # Fix 5: Ensure annotation IDs are sequential starting from 1
-        annotations = coco_data.get("annotations", [])
-        for i, annotation in enumerate(annotations):
+        # Ensure annotation IDs are sequential
+        for i, annotation in enumerate(coco_data.get("annotations", [])):
             annotation["id"] = i + 1
 
-        # Fix 6: Ensure we have valid info field
+        # Ensure required fields exist
         if "info" not in coco_data:
-            coco_data["info"] = {
-                "description": "CVAT Pseudo-labeling Export",
-                "version": "1.0",
-                "year": 2025,
-                "contributor": "Pseudo-labeling Pipeline",
-                "date_created": "2025"
-            }
-
-        # Fix 7: Ensure we have licenses field
+            coco_data["info"] = {"description": "Pseudo-labeling Export", "version": "1.0"}
         if "licenses" not in coco_data:
             coco_data["licenses"] = []
-
-        print(
-            f"After fixes - Categories: {len(categories)}, Images: {len(coco_data.get('images', []))}, Annotations: {len(coco_data.get('annotations', []))}")
 
         # Save the corrected COCO file
         with open(json_path, "w") as f:
             json.dump(coco_data, f, indent=2)
 
-        print(f"COCO file cleaned and saved to {json_path}")
+        print(f"✓ COCO annotations cleaned and saved")
 
         # ========== UPLOAD TO CVAT ==========
-        # Get dataset labels for CVAT project creation
         dataset_labels = self._get_dataset_labels()
 
         try:
-            self.cvat.authenticate(username, password)
-            project_id = self.cvat.get_or_create_project(project_name, dataset_labels)
-            task_name = f"{self.flow_id}-iter{self.current_iteration}-corrections"
+            config = getattr(self, 'cvat_project_config', {})
+            project_name_to_use = config.get('project_name') or f"{self.flow_id}-project"
+
+            # Create/find project
+            project_id = self.cvat.get_or_create_project(
+                project_name_to_use,
+                dataset_labels,
+                project_id=config.get('project_id')
+            )
+
+            # Create task
+            task_name = f"{self.flow_id}-iter{self.current_iteration}"
             task_id = self.cvat.create_task(project_id, task_name)
 
             # Upload images
             image_dir = export_path / "images"
             if image_dir.exists():
                 self.cvat.upload_images(task_id, str(image_dir))
+                print(f"✓ Uploaded images to CVAT")
 
             # Upload annotations
             self.cvat.upload_annotations(task_id, str(json_path))
+            print(f"✓ Uploaded annotations to CVAT")
 
             task_url = f"{self.cvat.cvat_url}/tasks/{task_id}"
-            print(f"CVAT task URL: {task_url}")
+            print(f"✓ CVAT task ready: {task_url}")
 
         except Exception as e:
-            print(f"Error during CVAT upload: {e}")
+            print(f"✗ CVAT upload failed: {e}")
+            raise
 
     def merge_pseudo_labels(self, manual_annotation_path=None, pseudo_only=False):
         """
         SIMPLIFIED merge logic with clear separation of manual vs auto modes.
-
-        Args:
-            manual_annotation_path (str, optional): Path to manually corrected COCO annotation file.
-            pseudo_only (bool): If True, train only on pseudo-labels (skip initial dataset)
         """
+        # Check if merge already completed
+        current_status = self.db.get_iteration_status(self.flow_id, self.current_iteration)
+        if current_status in ['MERGE_COMPLETE', 'TRAINING', 'TRAINING_COMPLETE',
+                              'EVALUATING', 'EVALUATION_COMPLETE', 'COMPLETED']:
+            print(f"Merge already completed for iteration {self.current_iteration} (status: {current_status})")
+            return
+
+        if self.manual_corrections_global and current_status == 'CVAT_PENDING':
+            if manual_annotation_path is None:
+                print("CVAT annotations are pending. Please complete your annotations in CVAT first.")
+                print("Then provide the manual_annotation_path parameter of the new annotation json file (in COCO) to proceed with merge.")
+                return
+            else:
+                print("✓ Manual annotation path provided, proceeding with merge...")
+
         print("Starting simplified merge process...")
         self.db.update_status(self.flow_id, self.current_iteration, 'MERGING')
 
@@ -1493,6 +1807,11 @@ class PseudoLabelingPipeline:
             raise ValueError(
                 "Training configuration not set. Run setup_training_config() or set train_cfg dictionary first.")
 
+        current_status = self.db.get_iteration_status(self.flow_id, self.current_iteration)
+        if current_status in ['TRAINING_COMPLETE', 'EVALUATING', 'EVALUATION_COMPLETE', 'COMPLETED']:
+            print(f"✓ Training already completed for iteration {self.current_iteration} (status: {current_status})")
+            return
+
         print("Starting model training...")
         self.db.update_status(self.flow_id, self.current_iteration, 'TRAINING')
 
@@ -1609,6 +1928,12 @@ class PseudoLabelingPipeline:
 
     def evaluate_model(self):
         """Evaluate the current model on validation dataset. Can be run multiple times without restrictions."""
+        # Check if evaluation already completed
+        current_status = self.db.get_iteration_status(self.flow_id, self.current_iteration)
+        if current_status in ['EVALUATION_COMPLETE', 'COMPLETED']:
+            print(f"✓ Evaluation already completed for iteration {self.current_iteration} (status: {current_status})")
+            return
+
         # Ensure we have a model to evaluate
         if not self.model_uid:
             # Try to recover from database
