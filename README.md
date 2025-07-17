@@ -4,12 +4,14 @@
 
 An automated pseudo-labeling pipeline designed to streamline the annotation process for computer vision tasks. This tool iteratively improves model performance by using an initial model trained on a small set of manually annotated data to generate labels on new images, which can then be refined and used to retrain progressively better models.
 
+The code works on all tasks including Object Detection, Instance Segmentation, Semantic Segmentation, and Line Detection, however, CVAT integration for manual corrections has not been tested on Semantic Segmentation and Line Detection meaning it is safe to assume that the manual corrections with CVAT integration only works on Object Detection and Instance Segmentation. 
 ## Table of Contents
 
 - [Overview](#overview)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Key Concepts](#key-concepts)
+- [Data Compilation Strategy](#data-compilation-strategy)
 - [Pipeline Workflow](#pipeline-workflow)
 - [Configuration Guide](#configuration-guide)
 - [Manual Correction Setup (CVAT)](#manual-correction-setup-cvat)
@@ -48,18 +50,26 @@ Pseudo-labeling is a semi-supervised learning technique where:
 
 ## Installation
 
-### 1. Install Dependencies
+### Prerequisites
+- Python 3.11+
+- Poetry package manager
+
+### 1. Clone the Repository
 
 ```bash
-# Install required Python packages
-pip install -r requirements.txt
+git clone <repository-url>
+cd pseudo-labeling-pipeline
 ```
 
-### 2. Download Pipeline Files
+### 2. Install Dependencies with Poetry
 
-Download the following files to your project directory:
-- `pseudo_labeling.py` - Main pipeline class
-- `pseudo_labeling_notebook.ipynb` - Jupyter notebook interface
+```bash
+# Install all dependencies including the package itself
+poetry install
+
+# Verify installation
+poetry run python -c "from pseudo_labeling import PseudoLabelingPipeline; print('SUCCESS!')"
+```
 
 ### 3. OneDL Setup
 
@@ -77,11 +87,23 @@ If you plan to use manual corrections:
 
 ## Quick Start
 
-### Step 1: Configure Global Settings
+### Step 1: Launch Jupyter Notebook
 
-Open the Jupyter notebook and modify the **Global Initializers** section with your project details:
+```bash
+# Start Jupyter within the Poetry environment
+poetry run jupyter lab
+
+# Open the main notebook
+# Navigate to: notebooks/pseudo-labeling.ipynb
+```
+
+### Step 2: Configure Global Settings
+
+In the Jupyter notebook, modify the **Global Initializers** section with your project details:
 
 ```python
+from pseudo_labeling import PseudoLabelingPipeline
+
 pipeline = PseudoLabelingPipeline(
     project_name="your-project-name/your-subproject",           # Your OneDL project
     main_dataset_name="unlabeled-dataset:0",                   # Full unlabeled dataset
@@ -91,30 +113,49 @@ pipeline = PseudoLabelingPipeline(
     current_flow=0,                                            # Flow number (start with 0)
     min_confidence=0.5,                                        # Confidence threshold
     local_path='/path/to/your/local/storage',                  # Local storage path
-    cvat_project_id=88,                                        # CVAT project ID (optional)
     db_path="pseudo_labeling_metadata.db"                      # Database file path (No need to change)
+)
+
+# For manual connections using CVAT please update the function below. If you do not want to use CVAT please comment out the section.
+pipeline.cvat_connect(
+    username="",
+    password="",
+    organization="",
+    project_name=""  # ← Finds the project and if it doesn't exist it creates one
 )
 ```
 
-### Step 2: Set Training Configuration
+### Step 3: Set Training Configuration
 
-Configure your model training parameters:
+Configure your model training parameters using either method:
 
+**Option 1: Interactive widget setup**
 ```python
 train_cfg = pipeline.setup_training_config()
 ```
 
-This opens an interactive widget where you can select:
+**Option 2: Direct dictionary configuration (recommended for specific config)**
+```python
+pipeline.train_cfg = {
+    'model_type': 'FasterRCNNConfig',
+    'task_type': 'object_detection',
+    'backbone': 'RESNET_50',
+    'epochs': 6,
+    'batch_size': 6,
+}
+```
+
+This allows you to select:
 - **Model Type**: FasterRCNN (Object Detection) or MaskRCNN (Instance Segmentation)
 - **Backbone**: Neural network architecture
 - **Training Parameters**: Epochs, batch size, etc.
 
-### Step 3: Follow Notebook Steps to Train Initial Model (Section 1)
+### Step 4: Follow Notebook Steps to Train Initial Model (Section 1)
 - **This includes steps**
   - 1.1 Training and Evaluation
   - 1.2 Logging for Initial Metadata
 
-### Step 4: Choose Correction Strategy (Section 2)
+### Step 5: Choose Correction Strategy (Section 2)
 
 After training initial model, for each iteration, decide your correction strategy:
 
@@ -128,9 +169,54 @@ manual_corrections = False
 pipeline.setup_next_iteration(manual_corrections)
 ```
 
-### Step 4: Run the Pipeline
+### Step 6: Run the Pipeline
 
 Follow the notebook cells to execute each step of the pipeline automatically.
+
+## Usage as Python Package
+
+You can also use the pipeline directly in Python scripts:
+
+```python
+from pseudo_labeling import PseudoLabelingPipeline
+
+# Initialize pipeline
+pipeline = PseudoLabelingPipeline(
+    project_name="your-project",
+    main_dataset_name="unlabeled-data:0",
+    initial_annotated_dataset_name="initial-labels:0",
+    validation_dataset="validation:0",
+    sample_size_per_iter=100,
+    current_flow=0,
+    min_confidence=0.5
+)
+
+# Run automated pipeline
+pipeline.setup_next_iteration(manual_corrections=False)
+pipeline.sample_unseen_inputs()
+pipeline.run_inference()
+pipeline.merge_pseudo_labels()
+pipeline.train_model()
+pipeline.evaluate_model()
+pipeline.complete_iteration()
+```
+
+## Project Structure
+
+```
+pseudo-labeling-pipeline/
+├── src/
+│   └── pseudo_labeling/
+│       ├── __init__.py           # Package initialization
+│       ├── pipeline.py           # Main PseudoLabelingPipeline class
+│       ├── cvat_manager.py       # CVAT integration
+│       └── database_pseudo.py    # Database operations
+├── notebooks/
+│   └── pseudo-labeling.ipynb     # Main Jupyter notebook interface
+├── pyproject.toml               # Poetry configuration
+├── poetry.lock                  # Dependency lock file
+└── README.md                    # This file
+```
 
 ## Key Concepts
 
@@ -144,14 +230,6 @@ Follow the notebook cells to execute each step of the pipeline automatically.
   - Iteration 0: Train on initial annotated data only
   - Iteration 1+: Add new pseudo-labeled data and retrain
 
-### Data Accumulation Strategy
-
-The pipeline implements intelligent data accumulation:
-- **New Samples**: Each iteration samples fresh unlabeled images
-- **Past Pseudo-Labels**: All previously used pseudo-labeled images are re-processed after each iteration.
-- **Updated Predictions**: Newer, better models generate improved labels on old data
-- **Progressive Growth**: Training set expands while improving label quality
-
 ### Database Schema
 
 The SQLite database tracks comprehensive metadata:
@@ -164,23 +242,92 @@ The SQLite database tracks comprehensive metadata:
 - Status tracking
 - Timestamps and completion records
 
+## Data Compilation Strategy
+
+### How Data Accumulates Across Iterations
+
+The pipeline implements an intelligent data accumulation strategy:
+
+#### Each Iteration Process:
+```
+Iteration 0: Train on initial data only
+Iteration 1: Sample 150 new images → Generate predictions on ALL 150 → Train on initial + 150 pseudo
+Iteration 2: Sample 150 more images → Generate predictions on ALL 300 images → Train on initial + 300 pseudo
+Iteration 3: Sample 150 more images → Generate predictions on ALL 450 images → Train on initial + 450 pseudo
+```
+
+### Why Re-process Old Data?
+
+As your model improves across iterations, it generates better predictions on previously seen data.
+
+#### Example Timeline:
+1. **Iteration 1**: Model generates predictions on 150 images
+2. **Iteration 2**: Improved model re-processes the same 150 images + 150 new images
+3. **Iteration 3**: Even better model re-processes all 300 images + 150 new images
+
+**Result**: Old pseudo-labels continuously improve, leading to better training data quality.
+
+### Data Flow Visualization
+
+```
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│   Iteration 1   │    │   Iteration 2    │    │   Iteration 3   │
+│                 │    │                  │    │                 │
+│ Sample: 150 new │    │ Sample: 150 new  │    │ Sample: 150 new │
+│ Total: 150      │    │ Total: 300       │    │ Total: 450      │
+│                 │    │                  │    │                 │
+│ Model v1 →      │    │ Model v2 →       │    │ Model v3 →      │
+│ Predicts all    │    │ Re-predicts all  │    │ Re-predicts all │
+│ 150 images      │    │ 300 images       │    │ 450 images      │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+```
+
+### Manual vs Automated Correction Impact
+
+#### Manual Correction Mode
+- **New samples**: Get corrected by humans → Added to manual corrections dataset
+- **Old pseudo-labels**: Get re-predicted by improved model → Updated in pseudo dataset
+- **Training data**: Initial + Manual corrections + Updated pseudo-labels
+
+#### Automated Mode
+- **All samples**: Get re-predicted by improved model with confidence filtering
+- **Training data**: Initial + All updated pseudo-labels
+
+### Dataset Architecture
+
+The pipeline maintains separate datasets for different types of data:
+
+```
+Your Training Flow
+├── initial-annotations:0        (Fixed: Your manually labeled data)
+├── pseudo-f0                   (Growing: Auto pseudo-labels, updated each iteration)
+├── manual-corrections-f0       (Growing: Human-corrected labels)
+├── train-f0                    (Combined: Merged training set)
+└── temp-cvat-iter3-f0          (Temporary: For CVAT export)
+```
+
+**Key Benefits:**
+- **Continuous Improvement**: Old labels get better over time
+- **Quality Growth**: Training data quality improves with each iteration
+- **Efficiency**: Maximum value extracted from each image
+- **Flexibility**: Manual corrections preserved separately from auto labels
+
 ## Pipeline Workflow
 
 ### Phase 1: Initial Setup (Iteration 0)
 
 ```
-Initial Annotated Data → Train Baseline Model → Evaluate → Log Results
+Initial Annotated Data → Train Baseline Model → Evaluate
 ```
 
 1. **Load Initial Data**: Small manually annotated dataset
 2. **Train Model**: Create baseline model (FasterRCNN/MaskRCNN)
 3. **Evaluate**: Test performance on validation set
-4. **Log**: Record iteration 0 metadata
 
 ### Phase 2: Pseudo-Labeling Iterations (1, 2, 3...)
 
 ```
-Sample New Data → Combine with Past → Generate Predictions → Correct → Merge → Train → Evaluate → Log
+Sample New Data → Combine with Past → Generate Predictions → Correct → Merge → Train → Evaluate
 ```
 
 1. **Sample Unseen Inputs**: Select new unlabeled images from main dataset
@@ -192,7 +339,25 @@ Sample New Data → Combine with Past → Generate Predictions → Correct → M
 5. **Merge Datasets**: Combine initial annotations with new pseudo-labels
 6. **Train Updated Model**: Retrain on expanded dataset
 7. **Evaluate Performance**: Test on validation set
-8. **Log Results**: Record iteration metadata and metrics
+
+### Data Compilation Process (Detailed)
+
+#### For Each Iteration:
+
+1. **Sample New Images** (e.g., 150 new images)
+   ```
+   Before: Training set has 200 images
+   After: Candidate set has 350 images (200 old + 150 new)
+   ```
+
+2. **Apply Corrections**
+   - **Manual**: New images go to CVAT, old pseudo-labels get updated automatically
+   - **Auto**: All images get confidence filtering with improved model
+
+3. **Merge for Training**
+   ```
+   Final Training Set = Initial GT + Manual Corrections + Updated Pseudo-Labels
+   ```
 
 ### Correction Workflows
 
@@ -207,15 +372,6 @@ Predictions → Export to CVAT → Human Review → Import Corrections → Merge
 - Allows human review and correction
 - Downloads corrected annotations
 - Integrates back into pipeline
-
-#### Automated Workflow
-```
-Predictions → Confidence Filtering → Direct Merge
-```
-
-- Applies minimum confidence threshold
-- Automatically accepts high-confidence predictions
-- Faster iteration but potentially lower quality
 
 ## Configuration Guide
 
@@ -233,23 +389,17 @@ Predictions → Confidence Filtering → Direct Merge
 
 ### Advanced Parameters
 
-| Parameter | Description | Default                              |
-|-----------|-------------|--------------------------------------|
+| Parameter | Description | Default |
+|-----------|-------------|---------|
 | `local_path` | Local storage directory | Required if `manual_correction = True` |
-| `cvat_project_id` | CVAT project ID | `None`                               |
-| `db_path` | Database file path | `"pseudo_labeling_metadata.db"`      |
+| `db_path` | Database file path | `"pseudo_labeling_metadata.db"` |
 
 ### Training Configuration Options
 
 #### Model Types
 - **FasterRCNN**: Object detection (bounding boxes)
 - **MaskRCNN**: Instance segmentation (masks + boxes)
-
-#### Backbone Options
-- ResNet variants
-- RegNet variants
-- ConvNeXt variants
-- Custom architectures
+- All other models supported for object detection and instance segmentation.
 
 #### Training Parameters
 - **Epochs**: Number of training epochs (typically 20-100)
@@ -288,14 +438,20 @@ pipeline.manually_correct_cvat()
 - Pipeline creates CVAT project with appropriate labels
 - Uploads images and initial predictions
 - Provides CVAT task URL for annotation
-- Human annotators review and correct predictions
+- Human annotators review and correct predictions in CVAT interface
 
 #### 3. Import Corrections
+- After completing annotations in CVAT, export the corrected annotations as COCO format (Only annoations no need for images to also be exported)
+- Download and unzip the exported file to access the annotation JSON
+- Provide the path to the corrected annotation file when merging:
+
 ```python
 # Import corrected annotations and merge
-pipeline.merge_pseudo_labels()
-```
+pipeline.merge_pseudo_labels(manual_annotation_path='/path/to/corrected_annotations.json')
 
+
+
+```
 
 ## Database Management
 
@@ -324,91 +480,88 @@ CREATE TABLE iteration_metadata (
 
 The pipeline tracks detailed status updates throughout the lifecycle of each iteration. This includes sampling, inference, manual correction, training, evaluation, and completion.
 
-
-
 ## All Possible Status States
 
 ### Starting Iteration and Sampling Flow States
 
-| status              | description                                              |
-|---------------------|----------------------------------------------------------|
-| `INITIALIZED`       | iteration has been set up but no work started            |
-| `SAMPLING`          | currently sampling new images                            |
-| `SAMPLING_COMPLETE` | sampling finished successfully                           |
-| `PRE_INFERENCE`     | ready for inference (when using an existing dataset)     |
+| status | description |
+|--------|-------------|
+| `INITIALIZED` | iteration has been set up but no work started |
+| `SAMPLING` | currently sampling new images |
+| `SAMPLING_COMPLETE` | sampling finished successfully |
+| `PRE_INFERENCE` | ready for inference (when using an existing dataset) |
 
 ### Inference States
 
-| status               | description                                |
-|----------------------|--------------------------------------------|
-| `INFERENCE`          | running inference on images                |
-| `INFERENCE_COMPLETE` | inference completed successfully           |
+| status | description |
+|--------|-------------|
+| `INFERENCE` | running inference on images |
+| `INFERENCE_COMPLETE` | inference completed successfully |
 
 ### CVAT States
 
-| status         | description                                  |
-|----------------|----------------------------------------------|
-| `CVAT_EXPORT`  | exporting data to cvat for manual correction |
-| `CVAT_PENDING` | waiting for manual corrections in cvat       |
-| .....          | .......                                      |
-| `CVAT_FAILED`  | cvat export failed                           |
+| status | description |
+|--------|-------------|
+| `CVAT_EXPORT` | exporting data to cvat for manual correction |
+| `CVAT_PENDING` | waiting for manual corrections in cvat |
+| `CVAT_FAILED` | cvat export failed |
 
 ### Merging States
 
-| status           | description                               |
-|------------------|-------------------------------------------|
-| `MERGING`        | currently merging pseudo-labels           |
-| `MERGE_COMPLETE` | merging completed successfully            |
+| status | description |
+|--------|-------------|
+| `MERGING` | currently merging pseudo-labels |
+| `MERGE_COMPLETE` | merging completed successfully |
 
 ### Training States
 
-| status              | description                          |
-|---------------------|--------------------------------------|
-| `TRAINING`          | training job is running/waiting      |
-| `TRAINING_COMPLETE` | training completed successfully      |
-| `TRAINING_FAILED`   | training job failed                  |
-| `TRAINING_CANCELLED`| training job was cancelled           |
+| status | description |
+|--------|-------------|
+| `TRAINING` | training job is running/waiting |
+| `TRAINING_COMPLETE` | training completed successfully |
+| `TRAINING_FAILED` | training job failed |
+| `TRAINING_CANCELLED` | training job was cancelled |
 
 ### Evaluation States
 
-| status                 | description                          |
-|------------------------|--------------------------------------|
-| `EVALUATING`           | evaluation job is running/waiting    |
-| `EVALUATION_COMPLETE`  | evaluation completed successfully    |
-| `EVALUATION_FAILED`    | evaluation job failed                |
-| `EVALUATION_CANCELLED` | evaluation job was cancelled         |
+| status | description |
+|--------|-------------|
+| `EVALUATING` | evaluation job is running/waiting |
+| `EVALUATION_COMPLETE` | evaluation completed successfully |
+| `EVALUATION_FAILED` | evaluation job failed |
+| `EVALUATION_CANCELLED` | evaluation job was cancelled |
 
 ### Final State 
 
-| status      | description                |
-|-------------|----------------------------|
+| status | description |
+|--------|-------------|
 | `COMPLETED` | entire iteration completed |
 
 ---
 
-##  OneDL job states to database states
+## OneDL job states to database states
 
 ### Training 
 
-| job state     | database status       |
-|---------------|------------------------|
-| `DONE`        | `TRAINING_COMPLETE`    |
-| `FAILED`      | `TRAINING_FAILED`      |
-| `CANCELLED`   | `TRAINING_CANCELLED`   |
-| `RUNNING`     | `TRAINING`             |
-| `WAITING`     | `TRAINING`             |
-| `UNALLOCABLE` | `TRAINING`             |
+| job state | database status |
+|-----------|-----------------|
+| `DONE` | `TRAINING_COMPLETE` |
+| `FAILED` | `TRAINING_FAILED` |
+| `CANCELLED` | `TRAINING_CANCELLED` |
+| `RUNNING` | `TRAINING` |
+| `WAITING` | `TRAINING` |
+| `UNALLOCABLE` | `TRAINING` |
 
 ### Evaluation 
 
-| job state     | database status         |
-|---------------|--------------------------|
-| `DONE`        | `EVALUATION_COMPLETE`    |
-| `FAILED`      | `EVALUATION_FAILED`      |
-| `CANCELLED`   | `EVALUATION_CANCELLED`   |
-| `RUNNING`     | `EVALUATING`             |
-| `WAITING`     | `EVALUATING`             |
-| `UNALLOCABLE` | `EVALUATING`             |
+| job state | database status |
+|-----------|-----------------|
+| `DONE` | `EVALUATION_COMPLETE` |
+| `FAILED` | `EVALUATION_FAILED` |
+| `CANCELLED` | `EVALUATION_CANCELLED` |
+| `RUNNING` | `EVALUATING` |
+| `WAITING` | `EVALUATING` |
+| `UNALLOCABLE` | `EVALUATING` |
 
 ## Database Operations
 
@@ -443,6 +596,7 @@ cp pseudo_labeling_metadata_backup.db pseudo_labeling_metadata.db
 ## Troubleshooting
 
 ### Common Issues
+
 
 #### 1. Model UID Not Set
 ```
@@ -491,21 +645,7 @@ Error: Training job failed
 - Adjust training parameters (batch size, epochs)
 - Ensure sufficient computational resources
 
-### Performance Optimization
-
-#### 1. Confidence Threshold
-- Higher thresholds (0.7-0.9): Fewer but higher quality pseudo-labels (Recommended)
-- Lower thresholds (0.3-0.5): More pseudo-labels but potentially noisier
-
-#### 2. Sample Size Strategy
-- Smaller iterations (50-100): More control, slower progress (Recommended)
-- Larger iterations (200-500): Faster progress, less control
-
-#### 3. Database 
-- It is highly recommended to review the SQLite database to ensure all processes are functioning correctly and no issues have occurred.
-
-
-## Advanced Usage and Notes
+## Advanced Usage
 
 ### Multiple Flow Management
 
@@ -558,45 +698,8 @@ for iteration in range(1, 6):  # Run 5 iterations
 ```
 Please note that to run this loop, `manual_corrections` must be `False`
 
-
-## Best Practices
-
-### 1. Data Quality
-- **Start Strong**: Ensure high-quality initial annotations
-- **Consistent Standards**: Maintain annotation consistency throughout
-- **Regular Review**: Review pseudo-labels for quality
-- **Validation Monitoring**: Watch validation metrics 
-
-### 2. Iteration Strategy
-- **Conservative Start**: Begin with higher confidence thresholds
-- **Gradual Expansion**: Increase sample sizes as model improves
-- **Strategic Corrections**: Use manual corrections for challenging cases
-- **Regular Evaluation**: Monitor performance trends across iterations
-
-### 3. Resource Management
-- **Storage Planning**: Make sure you keep an eye on disk usage for exporting data
-- **Database Review**: Regularly review the database
-
-### 4. Experimental Design
-- **Control Groups**: Compare different flows/strategies
-- **Baseline Comparison**: Compare against traditional annotation
-
-## Changelog and Versioning
-
-### Current Features
-- Automated pseudo-labeling pipeline
-- CVAT integration for manual corrections
-- SQLite database for metadata tracking
-- Support for FasterRCNN and MaskRCNN
-- Flexible configuration system
-- Status monitoring and logging
-- Data accumulation across iterations
-
-### Planned Enhancements
-- Specifying CVAT organization project and folder
-- Fixing CVAT Authentication
-
 ---
+
 
 ## Acknowledgments
 
