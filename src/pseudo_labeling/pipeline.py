@@ -113,7 +113,7 @@ class PseudoLabelingPipeline:
         print(f"Selected flow: {self.flow_id}")
 
         # Load initial dataset to get sample count (always available)
-        initial_dataset = self.client.datasets.load(self.initial_annotated_dataset_name, pull_blobs=True)
+        initial_dataset = self.client.datasets.load(self.initial_annotated_dataset_name, pull_blobs=True, pull_policy='missing')
         self.n_initial_samples = len(initial_dataset)
         print(f"Initial annotated dataset contains: {self.n_initial_samples} samples")
 
@@ -661,7 +661,7 @@ class PseudoLabelingPipeline:
         if self.manual_corrections_global:
             # For manual corrections - create temp dataset (inputs only)
             temp_dataset = Dataset(inputs=new_sampled_data.inputs)
-            self.client.datasets.save(self.pseudo_input_dataset_name, temp_dataset, exist="overwrite")
+            self.client.datasets.save(self.pseudo_input_dataset_name, temp_dataset, exist="version")
             self.client.datasets.push(self.pseudo_input_dataset_name, push_policy="version")
             print(f"✓ Created temp dataset for CVAT: {self.pseudo_input_dataset_name}")
         else:

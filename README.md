@@ -188,7 +188,9 @@ pipeline = PseudoLabelingPipeline(
     validation_dataset="validation:0",
     sample_size_per_iter=100,
     current_flow=0,
-    min_confidence=0.5
+    min_confidence=0.5,
+    local_path='/Users/name/Documents/.../...', # For CVAT API Integration, please specify if you want to manually correct in CVAT
+    db_path="pseudo_test.db" # For metadata, RECOMMENDED - Open the database and keep track of the metadata from each iteration
 )
 
 # Run automated pipeline
@@ -699,8 +701,29 @@ for iteration in range(1, 6):  # Run 5 iterations
 Please note that to run this loop, `manual_corrections` must be `False`
 
 ---
+### Future Work
 
+#### 1. COCO Export JSON Preprocessing
+The pipeline currently applies several fixes to OneDL's COCO export format in `_export_to_cvat()` to ensure CVAT compatibility:
 
+- **Category ID normalization**: Adjusts category IDs to start from 1 instead of 0
+- **Image ID sequential mapping**: Ensures image IDs are sequential and start from 1
+- **File path sanitization**: Strips directory paths to use only filenames
+- **Annotation field cleanup**: Removes problematic fields like `score` and ensures required fields like `iscrowd` and `area`
+- **Missing metadata addition**: Adds required `info` and `licenses` sections
+
+**Recommendation**: These adjustments should ideally be integrated into OneDL's `export_coco()` function itself. If OneDL updates their COCO export format, the manual correction workflow may break and require updates to the preprocessing logic.
+
+#### 2. State Recovery & Kernel Interruptions
+The pipeline includes auto-recovery mechanisms for kernel restarts, but excessive interruptions may cause:
+
+- **Status tracking inconsistencies** between database and actual dataset states
+- **Incomplete dataset uploads** that require manual cleanup
+- **Recovery logic confusion** when iterations are partially completed
+
+**Recommendation**: Minimize kernel restarts during active iterations. If frequent interruptions occur, consider adding more robust state validation checks and dataset existence verification during recovery.
+
+---
 ## Acknowledgments
 
 - OneDL access required for dataset management and model training
